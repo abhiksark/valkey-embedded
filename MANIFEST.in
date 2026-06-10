@@ -1,0 +1,12 @@
+include LICENSE.txt
+include *.md
+include src/valkey_embedded/py.typed
+include src/valkey_embedded/_dummy.c
+recursive-include tools *.py
+prune src/valkey_embedded/bin
+exclude src/valkey_embedded/package_metadata.json
+# The sdist ships the library only (httpx pattern): no tests, examples, or docs.
+prune tests
+prune examples
+prune docs
+prune .github

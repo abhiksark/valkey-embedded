@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.venv/
+venv/
+.mypy_cache/
+.coverage
+.env
+# Embedded server binary is built, not committed
+src/valkey_embedded/bin/valkey-server
+src/valkey_embedded/bin/valkey-cli
+src/valkey_embedded/bin/VALKEY_COPYING.txt
+src/valkey_embedded/package_metadata.json

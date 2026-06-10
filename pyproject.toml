@@ -1,0 +1,104 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "valkey-embedded"
+version = "0.1.0"
+description = "Embedded, auto-managed Valkey server for Python"
+readme = "README.md"
+requires-python = ">=3.9"
+license = "BSD-3-Clause"
+authors = [{ name = "Abhik Sarkar", email = "abhiksark@gmail.com" }]
+keywords = ["valkey", "redis", "embedded", "database", "testing"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Developers",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.9",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Operating System :: POSIX",
+  "Operating System :: MacOS",
+  "Topic :: Database",
+  "Framework :: Pytest",
+  "Typing :: Typed",
+]
+dependencies = ["valkey>=6.0", "psutil>=5.9"]
+
+[project.optional-dependencies]
+test = ["pytest>=7.4"]
+dev = [
+  "valkey-embedded[test]",
+  "ruff",
+  "mypy",
+  "types-psutil",
+  "build",
+  "twine",
+  "check-manifest",
+  "interrogate",
+  "pytest-cov",
+]
+
+[project.scripts]
+valkey-embedded = "valkey_embedded.__main__:main"
+
+# Auto-register the fixtures (valkey_server, valkey_client, valkey_url,
+# valkey_server_factory) for any installed consumer's pytest run.
+[project.entry-points.pytest11]
+valkey_embedded = "valkey_embedded.pytest_plugin"
+
+[project.urls]
+Homepage = "https://github.com/abhiksark/valkey-embedded"
+Source = "https://github.com/abhiksark/valkey-embedded"
+Documentation = "https://github.com/abhiksark/valkey-embedded#readme"
+Changelog = "https://github.com/abhiksark/valkey-embedded/blob/main/CHANGELOG.md"
+Issues = "https://github.com/abhiksark/valkey-embedded/issues"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+include-package-data = true
+
+[tool.setuptools.packages.find]
+where = ["src"]
+exclude = ["valkey_embedded.bin", "valkey_embedded.bin.*"]
+
+[tool.setuptools.package-data]
+valkey_embedded = ["py.typed", "bin/valkey-server", "bin/valkey-cli", "bin/VALKEY_COPYING.txt", "package_metadata.json"]
+
+[tool.ruff]
+target-version = "py39"
+
+[tool.coverage.run]
+source = ["valkey_embedded"]
+
+[tool.interrogate]
+fail-under = 80
+exclude = ["tests", "examples", "tools", "build", ".venv"]
+
+# B404/B603: subprocess with the package-controlled bundled binary IS the
+# package's purpose (no shell, no untrusted input). B110: deliberate
+# best-effort cleanup/shutdown paths, each commented at the call site.
+# B101: asserts are mypy type-narrowing on invariants that hold by
+# construction, not security guards.
+[tool.bandit]
+skips = ["B404", "B603", "B110", "B101"]
+
+# Files intentionally excluded from the sdist (policy, not drift): the sdist
+# ships the library only; tests/examples/docs live in the repository.
+[tool.check-manifest]
+ignore = ["tests/**", "examples/**", "docs/**", ".github/**", ".coverage"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# Deselect the heavy/network `slow` tier by default; run it with `pytest -m slow`.
+# A CLI `-m` overrides this (e.g. `pytest -m slow` or `pytest -m "slow or not slow"`).
+addopts = "-v -m 'not slow'"
+markers = [
+  "slow: heavy or network-dependent (sdist build, clean-venv wheel install); deselected by default",
+  "packaging: inspects build artifacts (sdist/wheel contents); offline and fast",
+  "examples: runs the scripts in examples/ end-to-end as living documentation",
+]
