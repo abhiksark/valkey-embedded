@@ -1,0 +1,32 @@
+name: Bug report
+description: Something doesn't work as documented
+labels: ["bug"]
+body:
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: What did you do, what did you expect, what happened instead?
+      placeholder: |
+        1. ...
+        2. ...
+        Expected: ...
+        Got: ...
+    validations:
+      required: true
+  - type: textarea
+    id: debug-output
+    attributes:
+      label: Diagnostics
+      description: Paste the full output of `python -m valkey_embedded.debug`
+      render: text
+    validations:
+      required: true
+  - type: textarea
+    id: snippet
+    attributes:
+      label: Minimal reproduction
+      description: The smallest code snippet that triggers the problem
+      render: python
+    validations:
+      required: false
