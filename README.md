@@ -17,9 +17,10 @@ conn.get("key")          # b'value'
 # server is stopped and cleaned up when the process exits
 ```
 
-It is a modern, BSD-3-Clause reimplementation of the
-[`redislite`](https://github.com/yahoo/redislite) pattern, targeting Valkey so the
-embedded binary can be freely redistributed on PyPI.
+This project is motivated by [redislite](https://github.com/yahoo/redislite) — the
+same embed-the-real-engine idea, reimplemented from scratch under BSD-3-Clause and
+targeting [Valkey](https://valkey.io/) so the embedded binary can be freely
+redistributed on PyPI.
 
 ## When to use valkey-embedded
 
