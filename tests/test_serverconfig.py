@@ -6,7 +6,9 @@ server reflects it via CONFIG GET and on-disk socket state.
 """
 
 import os
+import shutil
 import stat
+import tempfile
 
 from valkey_embedded import Valkey
 
@@ -70,8 +72,12 @@ def test_socket_is_owner_only():
         conn._cleanup()
 
 
-def test_custom_unix_socket_path(tmp_path):
-    sock = str(tmp_path / "custom.sock")
+def test_custom_unix_socket_path():
+    # A user-supplied socket path is honored verbatim (no relocation), so the
+    # test must keep it under the sun_path limit itself; pytest's tmp_path on
+    # macOS CI runners is too long. Use a short scratch dir instead.
+    short_dir = tempfile.mkdtemp(prefix="vk-", dir="/tmp")
+    sock = os.path.join(short_dir, "custom.sock")
     conn = Valkey(unix_socket_path=sock)
     try:
         assert conn.socket_file == sock
@@ -79,3 +85,4 @@ def test_custom_unix_socket_path(tmp_path):
         assert conn.ping() is True
     finally:
         conn._cleanup()
+        shutil.rmtree(short_dir, ignore_errors=True)

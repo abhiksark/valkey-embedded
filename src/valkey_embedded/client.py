@@ -41,6 +41,31 @@ class ServerStartError(ValkeyEmbeddedError):
     """The embedded valkey-server did not become ready in time."""
 
 
+# AF_UNIX sun_path is 104 bytes on macOS/BSD (108 on Linux); use the smaller
+# bound everywhere so behavior is portable.
+_SUN_PATH_LIMIT = 104
+
+
+def _socket_path_for(directory: str, name: str) -> "tuple[str, Optional[str]]":
+    """Socket path under ``directory``, relocated if it would overflow sun_path.
+
+    Deep directories (e.g. pytest's tmp_path on macOS) produce socket paths
+    longer than AF_UNIX allows, which the server cannot bind. In that case the
+    socket goes into a freshly created short temp dir instead.
+
+    Returns:
+        (socket_path, owned_tmp_dir): ``owned_tmp_dir`` is None when the
+        socket lives under ``directory``; otherwise it is the fallback dir the
+        caller must remove at cleanup.
+    """
+    candidate = os.path.join(directory, name)
+    if len(os.fsencode(candidate)) < _SUN_PATH_LIMIT:
+        return candidate, None
+    base = "/tmp" if os.path.isdir("/tmp") else None
+    short_dir = tempfile.mkdtemp(prefix="vkey-sock-", dir=base)
+    return os.path.join(short_dir, name), short_dir
+
+
 def _missing_binary_message(path: str) -> str:
     """Actionable error text for both pip-install and source-checkout users."""
     return (
@@ -137,8 +162,11 @@ class ValkeyMixin:
         os.makedirs(self.dbdir, exist_ok=True)
         self.pidfile = os.path.join(self.dbdir, "valkey.pid")
         self.logfile = os.path.join(self.dbdir, "valkey.log")
+        self._socket_dir: Optional[str] = None
         if not self.socket_file:
-            self.socket_file = os.path.join(self.dbdir, "valkey.socket")
+            self.socket_file, self._socket_dir = _socket_path_for(
+                self.dbdir, "valkey.socket"
+            )
 
         atexit.register(self._cleanup)
 
@@ -148,6 +176,11 @@ class ValkeyMixin:
                 logger.debug(
                     "Attached to shared server via %s", self.settingregistryfile
                 )
+                # The registry's socket replaced ours; drop the unused
+                # fallback dir if one was created.
+                if self._socket_dir:
+                    shutil.rmtree(self._socket_dir, ignore_errors=True)
+                    self._socket_dir = None
             else:
                 self._start_server()
                 started = True
@@ -167,6 +200,8 @@ class ValkeyMixin:
                     _safe_remove(self.settingregistryfile)
             if not self.settingregistryfile and self.dbdir:
                 shutil.rmtree(self.dbdir, ignore_errors=True)
+            if self._socket_dir:
+                shutil.rmtree(self._socket_dir, ignore_errors=True)
             try:
                 atexit.unregister(self._cleanup)
             except Exception:  # noqa: BLE001
@@ -357,6 +392,9 @@ class ValkeyMixin:
         elif self.dbdir:
             # Isolated: we own the whole temp tree.
             shutil.rmtree(self.dbdir, ignore_errors=True)
+        if self._socket_dir:
+            shutil.rmtree(self._socket_dir, ignore_errors=True)
+            self._socket_dir = None
 
     def __enter__(self) -> "ValkeyMixin":
         """Enter a ``with`` block; the server is already running."""
