@@ -48,7 +48,7 @@ jobs:
       # The compiled binary is reused across runs: build_valkey.py skips the
       # compile when the cached binary's recorded version matches. Hashing the
       # build script in the key invalidates the cache on any version bump.
-      - uses: actions/cache@1bd1e32a3bdc45362d1e726936510720a7c30a57 # v4.2.0
+      - uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
           path: |
             src/valkey_embedded/bin
