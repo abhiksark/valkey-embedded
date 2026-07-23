@@ -14,7 +14,7 @@ import pytest
 import valkey
 
 from valkey_embedded import ValkeyServer
-from valkey_embedded.server import _find_free_port
+from valkey_embedded.server import ServerStartError, _find_free_port
 
 
 def _port_is_listening(host, port):
@@ -47,6 +47,50 @@ def test_explicit_start_stop():
     finally:
         server.stop()
     assert not server.is_running()
+
+
+def test_start_is_idempotent_while_running():
+    server = ValkeyServer()
+    server.start()
+    try:
+        pid = server.pid
+        port = server.port
+
+        server.start()
+
+        assert server.pid == pid
+        assert server.port == port
+    finally:
+        server.stop()
+
+
+def test_stop_before_start_is_idempotent():
+    server = ValkeyServer()
+    workdir = server.data_dir
+
+    server.stop()
+    server.stop()
+
+    assert server.port is None
+    assert not os.path.exists(workdir)
+
+
+def test_wait_until_ready_times_out_after_connection_errors(monkeypatch):
+    server = ValkeyServer()
+    moments = iter([0.0, 0.0, 1.0])
+
+    def unavailable_client(**_kwargs):
+        raise valkey.exceptions.ConnectionError()
+
+    monkeypatch.setattr("valkey_embedded.server.time.monotonic", lambda: next(moments))
+    monkeypatch.setattr("valkey_embedded.server.time.sleep", lambda _seconds: None)
+    monkeypatch.setattr(server, "client", unavailable_client)
+
+    try:
+        with pytest.raises(ServerStartError, match="failed to start within 0.5s"):
+            server._wait_until_ready(timeout=0.5)
+    finally:
+        server.stop()
 
 
 def test_tcp_client_can_connect_with_byo_client():
@@ -162,3 +206,28 @@ def test_terminate_kills_immediately():
     server.terminate()
     assert not psutil.pid_exists(pid)
     assert not server.is_running()
+
+
+def test_stop_cleans_up_when_graceful_shutdown_raises(monkeypatch):
+    server = ValkeyServer()
+    server.start()
+    pid = server.pid
+    workdir = server.data_dir
+    shutdown_calls = []
+
+    class FailingClient:
+        def shutdown(self, **kwargs):
+            shutdown_calls.append(kwargs)
+            raise RuntimeError("simulated shutdown failure")
+
+    monkeypatch.setattr(server, "client", lambda **_kwargs: FailingClient())
+
+    try:
+        server.stop(timeout=0)
+        assert shutdown_calls == [{"nosave": True}]
+        assert not psutil.pid_exists(pid)
+        assert not os.path.exists(workdir)
+        assert not server.is_running()
+    finally:
+        if psutil.pid_exists(pid):
+            server.terminate()

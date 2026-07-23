@@ -63,8 +63,10 @@ jobs:
       # entry-point / conftest double-registration regression.
       - name: Install (compiles embedded Valkey)
         run: pip install .[dev]
-      - name: Run fast test suite (with coverage gate)
-        run: pytest -m "not slow" --cov=valkey_embedded --cov-fail-under=60
+      - name: Run fast test suite (with branch coverage gate)
+        run: |
+          coverage run -m pytest -m "not slow"
+          coverage report
         # Codecov upload can be added once the repository is public.
 
   packaging:
