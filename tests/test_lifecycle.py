@@ -68,20 +68,28 @@ def test_close_stops_isolated_server_and_removes_workdir(monkeypatch):
     pid = conn.pid
     dbdir = conn.dbdir
     disconnect = conn.connection_pool.disconnect
+    shutdown = conn.shutdown
     disconnect_calls = 0
+    shutdown_calls = []
 
     def tracked_disconnect():
         nonlocal disconnect_calls
         disconnect_calls += 1
         disconnect()
 
+    def tracked_shutdown(*args, **kwargs):
+        shutdown_calls.append((args, kwargs))
+        return shutdown(*args, **kwargs)
+
     monkeypatch.setattr(conn.connection_pool, "disconnect", tracked_disconnect)
+    monkeypatch.setattr(conn, "shutdown", tracked_shutdown)
     conn.close()
 
     assert _wait_dead(pid), "close() did not stop the isolated daemon"
     assert not os.path.exists(dbdir), "close() did not remove the workdir"
     assert conn.running is False
     assert disconnect_calls == 1
+    assert shutdown_calls == [((), {"nosave": True})]
 
 
 def test_shared_close_keeps_server_until_last_client(tmp_path, monkeypatch):
@@ -93,6 +101,8 @@ def test_shared_close_keeps_server_until_last_client(tmp_path, monkeypatch):
     first_disconnect = first.connection_pool.disconnect
     second_disconnect = second.connection_pool.disconnect
     disconnect_calls = {"first": 0, "second": 0}
+    shutdown = second.shutdown
+    shutdown_calls = []
 
     def track_first_disconnect():
         disconnect_calls["first"] += 1
@@ -102,8 +112,13 @@ def test_shared_close_keeps_server_until_last_client(tmp_path, monkeypatch):
         disconnect_calls["second"] += 1
         second_disconnect()
 
+    def track_shutdown(*args, **kwargs):
+        shutdown_calls.append((args, kwargs))
+        return shutdown(*args, **kwargs)
+
     monkeypatch.setattr(first.connection_pool, "disconnect", track_first_disconnect)
     monkeypatch.setattr(second.connection_pool, "disconnect", track_second_disconnect)
+    monkeypatch.setattr(second, "shutdown", track_shutdown)
 
     first.set("survives", "yes")
     first.close()
@@ -113,6 +128,7 @@ def test_shared_close_keeps_server_until_last_client(tmp_path, monkeypatch):
     assert psutil.pid_exists(pid)
     assert os.path.exists(registry)
     assert disconnect_calls["first"] == 1
+    assert shutdown_calls == []
 
     second.close()
 
@@ -120,6 +136,7 @@ def test_shared_close_keeps_server_until_last_client(tmp_path, monkeypatch):
     assert os.path.exists(dbfile), "last shared close() did not preserve the RDB"
     assert not os.path.exists(registry)
     assert disconnect_calls["second"] == 1
+    assert shutdown_calls == [((), {"save": True})]
 
 
 def test_shared_close_retries_after_ownership_check_failure(tmp_path, monkeypatch):

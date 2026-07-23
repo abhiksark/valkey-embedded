@@ -345,7 +345,10 @@ class ValkeyMixin:
                     # Capture the daemon pid BEFORE shutdown clears the pidfile.
                     pid = self.pid
                     try:
-                        self.shutdown(save=True)
+                        if self.settingregistryfile:
+                            self.shutdown(save=True)
+                        else:
+                            self.shutdown(nosave=True)
                     except Exception:  # noqa: BLE001 - server may already be gone
                         pass
                     self._terminate(pid)
