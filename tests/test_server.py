@@ -14,7 +14,7 @@ import pytest
 import valkey
 
 from valkey_embedded import ValkeyServer
-from valkey_embedded.server import _find_free_port
+from valkey_embedded.server import ServerStartError, _find_free_port
 
 
 def _port_is_listening(host, port):
@@ -60,6 +60,35 @@ def test_start_is_idempotent_while_running():
 
         assert server.pid == pid
         assert server.port == port
+    finally:
+        server.stop()
+
+
+def test_stop_before_start_is_idempotent():
+    server = ValkeyServer()
+    workdir = server.data_dir
+
+    server.stop()
+    server.stop()
+
+    assert server.port is None
+    assert not os.path.exists(workdir)
+
+
+def test_wait_until_ready_times_out_after_connection_errors(monkeypatch):
+    server = ValkeyServer()
+    moments = iter([0.0, 0.0, 1.0])
+
+    def unavailable_client(**_kwargs):
+        raise valkey.exceptions.ConnectionError()
+
+    monkeypatch.setattr("valkey_embedded.server.time.monotonic", lambda: next(moments))
+    monkeypatch.setattr("valkey_embedded.server.time.sleep", lambda _seconds: None)
+    monkeypatch.setattr(server, "client", unavailable_client)
+
+    try:
+        with pytest.raises(ServerStartError, match="failed to start within 0.5s"):
+            server._wait_until_ready(timeout=0.5)
     finally:
         server.stop()
 
