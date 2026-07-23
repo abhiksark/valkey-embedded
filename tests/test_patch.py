@@ -36,7 +36,7 @@ def test_patched_client_starts_embedded_server():
         try:
             assert conn.ping() is True
         finally:
-            conn._cleanup()
+            conn.close()
     finally:
         patch.unpatch_valkey()
 
@@ -65,7 +65,7 @@ def test_patched_strictvalkey_starts_embedded_server():
         try:
             assert conn.ping() is True
         finally:
-            conn._cleanup()
+            conn.close()
     finally:
         patch.unpatch_valkey()
 

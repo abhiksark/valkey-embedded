@@ -1,9 +1,9 @@
 # tests/test_lifecycle.py
-"""The headline promise: an embedded server is stopped and cleaned up when the
-owning process exits.
+"""The headline promise: an embedded server is stopped and cleaned up when its
+owner closes it or the owning process exits.
 
-The rest of the suite calls ``conn._cleanup()`` explicitly; these tests instead
-exercise the real ``atexit`` and ``__del__`` paths that back the README's claim.
+These tests exercise the public ``close()`` boundary and the ``atexit`` and
+``__del__`` fallbacks that back the README's claim.
 """
 
 import atexit
@@ -15,6 +15,8 @@ import sys
 import time
 
 import psutil
+import pytest
+from valkey.exceptions import TimeoutError as ValkeyTimeoutError
 
 from valkey_embedded import Valkey
 
@@ -60,23 +62,156 @@ def test_del_triggers_cleanup():
     assert not os.path.exists(dbdir), "__del__ did not remove the workdir"
 
 
-def test_double_cleanup_is_idempotent():
+def test_close_stops_isolated_server_and_removes_workdir(monkeypatch):
     conn = Valkey()
-    conn._cleanup()
-    # Second call short-circuits on `running is False` rather than erroring.
-    conn._cleanup()
+    pid = conn.pid
+    dbdir = conn.dbdir
+    disconnect = conn.connection_pool.disconnect
+    disconnect_calls = 0
+
+    def tracked_disconnect():
+        nonlocal disconnect_calls
+        disconnect_calls += 1
+        disconnect()
+
+    monkeypatch.setattr(conn.connection_pool, "disconnect", tracked_disconnect)
+    conn.close()
+
+    assert _wait_dead(pid), "close() did not stop the isolated daemon"
+    assert not os.path.exists(dbdir), "close() did not remove the workdir"
+    assert conn.running is False
+    assert disconnect_calls == 1
+
+
+def test_shared_close_keeps_server_until_last_client(tmp_path, monkeypatch):
+    dbfile = str(tmp_path / "shared.db")
+    registry = dbfile + ".settings"
+    first = Valkey(dbfile)
+    second = Valkey(dbfile)
+    pid = first.pid
+    first_disconnect = first.connection_pool.disconnect
+    second_disconnect = second.connection_pool.disconnect
+    disconnect_calls = {"first": 0, "second": 0}
+
+    def track_first_disconnect():
+        disconnect_calls["first"] += 1
+        first_disconnect()
+
+    def track_second_disconnect():
+        disconnect_calls["second"] += 1
+        second_disconnect()
+
+    monkeypatch.setattr(first.connection_pool, "disconnect", track_first_disconnect)
+    monkeypatch.setattr(second.connection_pool, "disconnect", track_second_disconnect)
+
+    first.set("survives", "yes")
+    first.close()
+
+    assert second.ping() is True
+    assert second.get("survives") == b"yes"
+    assert psutil.pid_exists(pid)
+    assert os.path.exists(registry)
+    assert disconnect_calls["first"] == 1
+
+    second.close()
+
+    assert _wait_dead(pid), "last shared close() did not stop the daemon"
+    assert os.path.exists(dbfile), "last shared close() did not preserve the RDB"
+    assert not os.path.exists(registry)
+    assert disconnect_calls["second"] == 1
+
+
+def test_shared_close_retries_after_ownership_check_failure(tmp_path, monkeypatch):
+    dbfile = str(tmp_path / "retry.db")
+    registry = dbfile + ".settings"
+    conn = Valkey(dbfile)
+    pid = conn.pid
+    connection_count = conn._connection_count
+    unregister = atexit.unregister
+    unregister_calls = []
+    attempts = 0
+
+    def fail_once():
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise ValkeyTimeoutError("simulated CLIENT LIST timeout")
+        return connection_count()
+
+    def tracked_unregister(callback):
+        unregister_calls.append(callback)
+        return unregister(callback)
+
+    monkeypatch.setattr(conn, "_connection_count", fail_once)
+    monkeypatch.setattr(atexit, "unregister", tracked_unregister)
+
+    try:
+        with pytest.raises(ValkeyTimeoutError, match="CLIENT LIST timeout"):
+            conn.close()
+
+        assert conn.running is True
+        assert psutil.pid_exists(pid)
+        assert os.path.exists(registry)
+        assert unregister_calls == []
+
+        conn.close()
+
+        assert attempts == 2
+        assert conn.running is False
+        assert _wait_dead(pid), "retry did not stop the shared daemon"
+        assert not os.path.exists(registry)
+        assert len(unregister_calls) == 1
+    finally:
+        if conn.running:
+            monkeypatch.setattr(conn, "_connection_count", connection_count)
+            conn.close()
+
+
+def test_close_is_idempotent():
+    conn = Valkey()
+    pid = conn.pid
+    dbdir = conn.dbdir
+
+    conn.close()
+    conn.close()
+
+    assert _wait_dead(pid)
+    assert not os.path.exists(dbdir)
     assert conn.running is False
 
 
-def test_cleanup_when_server_already_dead():
+def test_close_when_server_already_dead():
     conn = Valkey()
     pid = conn.pid
     proc = psutil.Process(pid)
     proc.kill()
     proc.wait(timeout=5)
 
-    # The daemon is already gone; cleanup must swallow the failed SHUTDOWN and
+    # The daemon is already gone; close must swallow the failed SHUTDOWN and
     # the NoSuchProcess in _terminate, and still remove the temp tree.
-    conn._cleanup()
+    conn.close()
     assert conn.running is False
     assert not os.path.exists(conn.dbdir)
+
+
+def test_close_inside_context_is_idempotent():
+    with Valkey() as conn:
+        pid = conn.pid
+        dbdir = conn.dbdir
+        conn.close()
+        assert conn.running is False
+
+    assert _wait_dead(pid)
+    assert not os.path.exists(dbdir)
+
+
+def test_repeated_create_close_cycles_leave_no_servers_or_workdirs():
+    resources = []
+    for _ in range(3):
+        conn = Valkey()
+        resources.append((conn.pid, conn.dbdir))
+        conn.close()
+
+    for pid, dbdir in resources:
+        assert _wait_dead(pid)
+        assert not os.path.exists(dbdir)
