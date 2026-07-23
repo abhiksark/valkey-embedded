@@ -19,7 +19,7 @@ def test_no_tempdir_leak_over_cycles():
     for _ in range(5):
         conn = Valkey()
         conn.ping()
-        conn._cleanup()
+        conn.close()
     leaked = set(glob.glob(_TEMPDIR_GLOB)) - before
     assert leaked == set(), "leaked temp dirs: {0}".format(leaked)
 
@@ -30,7 +30,7 @@ def test_no_orphan_processes_over_cycles():
         conn = Valkey()
         pids.append(conn.pid)
         conn.ping()
-        conn._cleanup()
+        conn.close()
     survivors = [pid for pid in pids if psutil.pid_exists(pid)]
     assert survivors == [], "orphaned valkey-server pids: {0}".format(survivors)
 
@@ -41,12 +41,12 @@ def test_no_fd_leak_over_cycles():
     for _ in range(2):
         conn = Valkey()
         conn.ping()
-        conn._cleanup()
+        conn.close()
     baseline = proc.num_fds()
     for _ in range(10):
         conn = Valkey()
         conn.ping()
-        conn._cleanup()
+        conn.close()
     grew = proc.num_fds() - baseline
     # A correct teardown returns to baseline; allow small slack for caching.
     assert grew <= 5, "fd count grew by {0} over 10 cycles".format(grew)

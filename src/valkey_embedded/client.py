@@ -18,6 +18,7 @@ import os
 import shutil
 import subprocess
 import tempfile
+import threading
 import time
 from typing import TYPE_CHECKING, Any, Optional
 
@@ -28,6 +29,10 @@ import valkey_embedded
 from valkey_embedded import configuration
 
 logger = logging.getLogger(__name__)
+
+# patch_valkey() replaces valkey.Valkey at runtime, so keep a stable reference
+# for inheritance and explicit upstream lifecycle calls.
+_ValkeyClient = valkey.Valkey
 
 DEFAULT_DBFILENAME = "valkey.db"
 DEFAULT_START_TIMEOUT = 10
@@ -134,6 +139,7 @@ class ValkeyMixin:
             ServerStartError: The bundled binary is missing or the server
                 did not answer PING within ``start_timeout`` seconds.
         """
+        self._lifecycle_lock = threading.Lock()
         self._server_config = dict(serverconfig or {})
         self._server_process: Optional[subprocess.Popen[bytes]] = None
         self.running = False
@@ -319,36 +325,58 @@ class ValkeyMixin:
             return 0
 
     def _cleanup(self) -> None:
-        """Shut down (if we're the last client), remove files, drop hooks."""
-        if not getattr(self, "running", False):
-            return
-        if self.settingregistryfile:
-            # Shared: only the last connected client shuts the server down.
-            # (CLIENT LIST count is a heuristic; simple clients hold a single
-            # connection, matching redislite's behavior.)
-            last_client = self._connection_count() <= 1
-        else:
-            # Isolated: we are the sole owner, so always shut down.
-            last_client = True
-        if last_client:
-            # Capture the daemon pid BEFORE shutdown clears the pidfile.
-            pid = self.pid
+        """Release the client and shut down its server if it is the last user."""
+        with self._lifecycle_lock:
+            if not getattr(self, "running", False):
+                _ValkeyClient.close(self)  # type: ignore[arg-type,no-untyped-call]
+                return
+
+            lifecycle_complete = False
             try:
-                self.shutdown(save=True)
-            except Exception:  # noqa: BLE001 - server may already be gone
-                pass
-            self._terminate(pid)
-            self._remove_files()
-        else:
-            try:
-                self.connection_pool.disconnect()
-            except Exception:  # noqa: BLE001
-                pass
-        self.running = False
-        try:
-            atexit.unregister(self._cleanup)
-        except Exception:  # noqa: BLE001
-            pass
+                if self.settingregistryfile:
+                    # Shared: only the last connected client shuts the server
+                    # down. (CLIENT LIST count is a heuristic; simple clients
+                    # hold one connection, matching redislite's behavior.)
+                    last_client = self._connection_count() <= 1
+                else:
+                    # Isolated: we are the sole owner, so always shut down.
+                    last_client = True
+                if last_client:
+                    # Capture the daemon pid BEFORE shutdown clears the pidfile.
+                    pid = self.pid
+                    try:
+                        if self.settingregistryfile:
+                            self.shutdown(save=True)
+                        else:
+                            self.shutdown(nosave=True)
+                    except Exception:  # noqa: BLE001 - server may already be gone
+                        pass
+                    self._terminate(pid)
+                    self._remove_files()
+                lifecycle_complete = True
+            finally:
+                # A failed ownership check or process cleanup must remain
+                # retryable. Only retire the lifecycle and its fallback hook once
+                # this client's server responsibility has been resolved.
+                if lifecycle_complete:
+                    self.running = False
+                    try:
+                        atexit.unregister(self._cleanup)
+                    except Exception:  # noqa: BLE001
+                        pass
+                # Call the concrete upstream implementation, not self.close(),
+                # because public close delegates here. valkey-py owns
+                # single-connection release and whether an internally-created
+                # pool should be disconnected.
+                _ValkeyClient.close(self)  # type: ignore[arg-type,no-untyped-call]
+
+    def close(self) -> None:
+        """Release this client and its embedded-server lifecycle.
+
+        Shared servers remain available until their last client closes.
+        Repeated calls are harmless.
+        """
+        self._cleanup()
 
     def _terminate(self, pid: int) -> None:
         """Wait for the daemon to exit, escalating to SIGTERM then SIGKILL.
@@ -406,12 +434,12 @@ class ValkeyMixin:
         This releases the embedded server itself, not merely the connection
         pool.
         """
-        self._cleanup()
+        self.close()
 
     def __del__(self) -> None:
         """Best-effort cleanup if the instance is garbage-collected."""
         try:
-            self._cleanup()
+            self.close()
         except Exception:  # noqa: BLE001 - never raise from __del__
             pass
 
@@ -427,7 +455,7 @@ class ValkeyMixin:
             return ""
 
 
-class Valkey(ValkeyMixin, valkey.Valkey):
+class Valkey(ValkeyMixin, _ValkeyClient):
     """valkey.Valkey backed by an embedded, auto-managed valkey-server.
 
     The first positional argument is an RDB file **path**, not a host -- the

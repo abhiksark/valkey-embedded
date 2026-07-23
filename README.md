@@ -14,7 +14,8 @@ from valkey_embedded import Valkey
 conn = Valkey()
 conn.set("key", "value")
 conn.get("key")          # b'value'
-# server is stopped and cleaned up when the process exits
+conn.close()             # stop the server and clean up now
+# normal process exit is also a cleanup fallback
 ```
 
 This project is motivated by [redislite](https://github.com/yahoo/redislite) — the

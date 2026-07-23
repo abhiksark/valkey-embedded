@@ -5,6 +5,13 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 (0.x releases may change the API; changes are always noted here).
 
+## [Unreleased]
+
+### Fixed
+
+- `Valkey.close()` now stops the embedded server when the last client closes,
+  releases its connection pool, and cleans up owned runtime files immediately.
+
 ## [0.1.0] - 2026-06-18
 
 First release.
