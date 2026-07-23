@@ -20,7 +20,7 @@ minutes, once). On Debian/Ubuntu: `sudo apt install make gcc`. On macOS:
 Alternatively, run from a bare source checkout without installing:
 
 ```bash
-pip install valkey psutil pytest
+pip install valkey psutil pytest "coverage[toml]>=7"
 python tools/build_valkey.py          # build the embedded server once
 PYTHONPATH=src python -m pytest
 ```

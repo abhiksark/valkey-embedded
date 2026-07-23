@@ -224,11 +224,10 @@ def test_stop_cleans_up_when_graceful_shutdown_raises(monkeypatch):
 
     try:
         server.stop(timeout=0)
+        assert shutdown_calls == [{"nosave": True}]
+        assert not psutil.pid_exists(pid)
+        assert not os.path.exists(workdir)
+        assert not server.is_running()
     finally:
         if psutil.pid_exists(pid):
             server.terminate()
-
-    assert shutdown_calls == [{"nosave": True}]
-    assert not psutil.pid_exists(pid)
-    assert not os.path.exists(workdir)
-    assert not server.is_running()
