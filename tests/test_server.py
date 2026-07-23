@@ -49,6 +49,21 @@ def test_explicit_start_stop():
     assert not server.is_running()
 
 
+def test_start_is_idempotent_while_running():
+    server = ValkeyServer()
+    server.start()
+    try:
+        pid = server.pid
+        port = server.port
+
+        server.start()
+
+        assert server.pid == pid
+        assert server.port == port
+    finally:
+        server.stop()
+
+
 def test_tcp_client_can_connect_with_byo_client():
     with ValkeyServer() as server:
         # A plain valkey-py client (not ours) connects over host/port.
@@ -161,4 +176,30 @@ def test_terminate_kills_immediately():
     pid = server.pid
     server.terminate()
     assert not psutil.pid_exists(pid)
+    assert not server.is_running()
+
+
+def test_stop_cleans_up_when_graceful_shutdown_raises(monkeypatch):
+    server = ValkeyServer()
+    server.start()
+    pid = server.pid
+    workdir = server.data_dir
+    shutdown_calls = []
+
+    class FailingClient:
+        def shutdown(self, **kwargs):
+            shutdown_calls.append(kwargs)
+            raise RuntimeError("simulated shutdown failure")
+
+    monkeypatch.setattr(server, "client", lambda **_kwargs: FailingClient())
+
+    try:
+        server.stop(timeout=0)
+    finally:
+        if psutil.pid_exists(pid):
+            server.terminate()
+
+    assert shutdown_calls == [{"nosave": True}]
+    assert not psutil.pid_exists(pid)
+    assert not os.path.exists(workdir)
     assert not server.is_running()

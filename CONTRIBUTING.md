@@ -37,6 +37,17 @@ pytest -m examples      # runs every script in examples/ end-to-end
 The full suite must be green before a PR is merged. CI runs the fast tier on
 Python 3.9 and 3.13 (Linux + macOS), plus lint and packaging jobs.
 
+Run the same branch-aware coverage gate as CI with:
+
+```bash
+coverage run -m pytest -m "not slow"
+coverage report
+```
+
+Coverage starts before pytest discovers the package's bundled plugin, so
+import-time package code is measured correctly. The combined statement and
+branch coverage must be at least 90%.
+
 ## Lint and formatting
 
 ```bash

@@ -269,6 +269,46 @@ def test_close_when_server_already_dead():
     assert not os.path.exists(conn.dbdir)
 
 
+def test_close_cleans_up_when_graceful_shutdown_raises(monkeypatch):
+    conn = Valkey()
+    pid = conn.pid
+    dbdir = conn.dbdir
+    disconnect = conn.connection_pool.disconnect
+    disconnect_calls = 0
+    terminate_calls = []
+
+    def fail_shutdown(**_kwargs):
+        raise RuntimeError("simulated shutdown failure")
+
+    def terminate_now(captured_pid):
+        terminate_calls.append(captured_pid)
+        proc = psutil.Process(captured_pid)
+        proc.kill()
+        proc.wait(timeout=5)
+
+    def tracked_disconnect():
+        nonlocal disconnect_calls
+        disconnect_calls += 1
+        disconnect()
+
+    monkeypatch.setattr(conn, "shutdown", fail_shutdown)
+    monkeypatch.setattr(conn, "_terminate", terminate_now)
+    monkeypatch.setattr(conn.connection_pool, "disconnect", tracked_disconnect)
+
+    try:
+        conn.close()
+    finally:
+        if psutil.pid_exists(pid):
+            proc = psutil.Process(pid)
+            proc.kill()
+            proc.wait(timeout=5)
+
+    assert terminate_calls == [pid]
+    assert disconnect_calls == 1
+    assert conn.running is False
+    assert not os.path.exists(dbdir)
+
+
 def test_close_inside_context_is_idempotent():
     with Valkey() as conn:
         pid = conn.pid
