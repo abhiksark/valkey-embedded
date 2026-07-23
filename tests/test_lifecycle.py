@@ -12,6 +12,7 @@ import json
 import os
 import subprocess
 import sys
+import threading
 import time
 
 import psutil
@@ -175,6 +176,63 @@ def test_close_is_idempotent():
     conn.close()
     conn.close()
 
+    assert _wait_dead(pid)
+    assert not os.path.exists(dbdir)
+    assert conn.running is False
+
+
+def test_concurrent_close_runs_lifecycle_once(monkeypatch):
+    conn = Valkey()
+    pid = conn.pid
+    dbdir = conn.dbdir
+    shutdown = conn.shutdown
+    shutdown_entered = threading.Event()
+    second_close_attempted = threading.Event()
+    duplicate_shutdown = threading.Event()
+    release_shutdown = threading.Event()
+    calls_lock = threading.Lock()
+    shutdown_calls = 0
+    errors = []
+
+    def blocked_shutdown(*args, **kwargs):
+        nonlocal shutdown_calls
+        with calls_lock:
+            shutdown_calls += 1
+            if shutdown_calls > 1:
+                duplicate_shutdown.set()
+        shutdown_entered.set()
+        if not release_shutdown.wait(timeout=5):
+            raise AssertionError("timed out waiting to release shutdown")
+        return shutdown(*args, **kwargs)
+
+    def close_client(attempted=None):
+        if attempted is not None:
+            attempted.set()
+        try:
+            conn.close()
+        except BaseException as exc:  # noqa: BLE001 - propagate worker failures
+            errors.append(exc)
+
+    monkeypatch.setattr(conn, "shutdown", blocked_shutdown)
+    first = threading.Thread(target=close_client)
+    first.start()
+    assert shutdown_entered.wait(timeout=5)
+
+    second = threading.Thread(target=close_client, args=(second_close_attempted,))
+    second.start()
+    assert second_close_attempted.wait(timeout=5)
+    try:
+        assert not duplicate_shutdown.wait(timeout=0.2)
+    finally:
+        release_shutdown.set()
+
+    first.join(timeout=5)
+    second.join(timeout=5)
+
+    assert not first.is_alive()
+    assert not second.is_alive()
+    assert errors == []
+    assert shutdown_calls == 1
     assert _wait_dead(pid)
     assert not os.path.exists(dbdir)
     assert conn.running is False
