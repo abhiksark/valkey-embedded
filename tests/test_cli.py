@@ -148,6 +148,46 @@ def _wait_for_line(proc, needle, timeout=15.0):
     return None
 
 
+def test_requested_port_collision_exits_nonzero_without_stopping_owner(tmp_path):
+    from valkey_embedded import ValkeyServer
+
+    owner = ValkeyServer()
+    owner_client = None
+    try:
+        owner.start()
+        owner_client = owner.client()
+        owner_client.set("owner", "still-running")
+        failed_data_dir = tmp_path / "failed-cli"
+
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "valkey_embedded",
+                "--port",
+                str(owner.port),
+                "--data-dir",
+                str(failed_data_dir),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            env=_ENV,
+            check=False,
+        )
+
+        assert result.returncode != 0
+        assert "Address already in use" in result.stderr
+        assert owner.is_running()
+        assert owner_client.get("owner") == b"still-running"
+        assert failed_data_dir.is_dir()
+        assert list(failed_data_dir.iterdir()) == []
+    finally:
+        if owner_client is not None:
+            owner_client.close()
+        owner.stop(timeout=0)
+
+
 def test_foreground_run_serves_then_stops_on_sigterm():
     port = _find_free_port()
     proc = subprocess.Popen(

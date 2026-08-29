@@ -18,6 +18,7 @@ import time
 from typing import List, Optional
 
 import valkey_embedded
+from valkey_embedded.client import ServerStartError
 from valkey_embedded.server import ValkeyServer
 
 
@@ -75,7 +76,11 @@ def main(argv: Optional[List[str]] = None) -> int:
         data_dir=args.data_dir,
         persist=args.persist,
     )
-    server.start()
+    try:
+        server.start()
+    except ServerStartError as exc:
+        print("valkey-embedded: {0}".format(exc), file=sys.stderr)
+        return 1
     print(
         "valkey-embedded listening on {0} (pid {1})".format(
             server.connection_url, server.pid

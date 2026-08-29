@@ -43,7 +43,7 @@ class ValkeyEmbeddedError(Exception):
 
 
 class ServerStartError(ValkeyEmbeddedError):
-    """The embedded valkey-server did not become ready in time."""
+    """The embedded valkey-server could not become identity-verified and ready."""
 
 
 # AF_UNIX sun_path is 104 bytes on macOS/BSD (108 on Linux); use the smaller
