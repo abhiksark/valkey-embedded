@@ -2,7 +2,7 @@ name: ci
 
 on:
   push:
-    branches: [main, master]
+    branches: [dev, main]
   pull_request:
 
 permissions:
@@ -48,7 +48,7 @@ jobs:
       # The compiled binary is reused across runs: build_valkey.py skips the
       # compile when the cached binary's recorded version matches. Hashing the
       # build script in the key invalidates the cache on any version bump.
-      - uses: actions/cache@1bd1e32a3bdc45362d1e726936510720a7c30a57 # v4.2.0
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             src/valkey_embedded/bin
@@ -63,8 +63,10 @@ jobs:
       # entry-point / conftest double-registration regression.
       - name: Install (compiles embedded Valkey)
         run: pip install .[dev]
-      - name: Run fast test suite (with coverage gate)
-        run: pytest -m "not slow" --cov=valkey_embedded --cov-fail-under=60
+      - name: Run fast test suite (with branch coverage gate)
+        run: |
+          coverage run -m pytest -m "not slow"
+          coverage report
         # Codecov upload can be added once the repository is public.
 
   packaging:

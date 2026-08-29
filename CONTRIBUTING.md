@@ -20,7 +20,7 @@ minutes, once). On Debian/Ubuntu: `sudo apt install make gcc`. On macOS:
 Alternatively, run from a bare source checkout without installing:
 
 ```bash
-pip install valkey psutil pytest
+pip install valkey psutil pytest "coverage[toml]>=7"
 python tools/build_valkey.py          # build the embedded server once
 PYTHONPATH=src python -m pytest
 ```
@@ -36,6 +36,17 @@ pytest -m examples      # runs every script in examples/ end-to-end
 
 The full suite must be green before a PR is merged. CI runs the fast tier on
 Python 3.9 and 3.13 (Linux + macOS), plus lint and packaging jobs.
+
+Run the same branch-aware coverage gate as CI with:
+
+```bash
+coverage run -m pytest -m "not slow"
+coverage report
+```
+
+Coverage starts before pytest discovers the package's bundled plugin, so
+import-time package code is measured correctly. The combined statement and
+branch coverage must be at least 90%.
 
 ## Lint and formatting
 

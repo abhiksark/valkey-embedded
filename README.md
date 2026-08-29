@@ -14,12 +14,14 @@ from valkey_embedded import Valkey
 conn = Valkey()
 conn.set("key", "value")
 conn.get("key")          # b'value'
-# server is stopped and cleaned up when the process exits
+conn.close()             # stop the server and clean up now
+# normal process exit is also a cleanup fallback
 ```
 
-It is a modern, BSD-3-Clause reimplementation of the
-[`redislite`](https://github.com/yahoo/redislite) pattern, targeting Valkey so the
-embedded binary can be freely redistributed on PyPI.
+This project is motivated by [redislite](https://github.com/yahoo/redislite) — the
+same embed-the-real-engine idea, reimplemented from scratch under BSD-3-Clause and
+targeting [Valkey](https://valkey.io/) so the embedded binary can be freely
+redistributed on PyPI.
 
 ## When to use valkey-embedded
 
@@ -67,10 +69,6 @@ database.
 ```bash
 pip install valkey-embedded          # prebuilt wheels: Linux x86_64, macOS 14+ arm64
 ```
-
-> *Publishing in progress:* the first release is not on PyPI yet. Until then,
-> install from source — `pip install git+https://github.com/abhiksark/valkey-embedded`
-> — which compiles the embedded Valkey (needs `gcc`/`clang` and `make`).
 
 Other POSIX platforms build Valkey from source at install time (needs `gcc`/`clang`
 and `make`). Windows is unsupported (WSL works).

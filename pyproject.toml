@@ -40,7 +40,7 @@ dev = [
   "twine",
   "check-manifest",
   "interrogate",
-  "pytest-cov",
+  "coverage[toml]>=7",
 ]
 
 [project.scripts]
@@ -72,8 +72,20 @@ valkey_embedded = ["py.typed", "bin/valkey-server", "bin/valkey-cli", "bin/VALKE
 [tool.ruff]
 target-version = "py39"
 
+# Ruff 0.16 expanded its implicit defaults substantially. Keep the repository's
+# established pycodestyle/pyflakes contract explicit and version-independent.
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F"]
+
 [tool.coverage.run]
+branch = true
 source = ["valkey_embedded"]
+
+[tool.coverage.report]
+fail_under = 90
+precision = 2
+show_missing = true
+skip_covered = true
 
 [tool.interrogate]
 fail-under = 80

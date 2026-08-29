@@ -31,6 +31,7 @@ from valkey_embedded.client import (
     ServerStartError,
     _missing_binary_message,
     _safe_remove,
+    _socket_path_for,
 )
 
 DEFAULT_START_TIMEOUT = 10.0
@@ -95,7 +96,11 @@ class ValkeyServer:
         self.dbfilename = "valkey.db"
         self.pidfile = os.path.join(self.data_dir, "valkey.pid")
         self.logfile = os.path.join(self.data_dir, "valkey.log")
-        self.socket_file = os.path.join(self.data_dir, "valkey.sock")
+        # Deep data dirs would overflow AF_UNIX's sun_path; relocate the
+        # socket to a short private dir in that case (cleaned up on stop).
+        self.socket_file, self._socket_dir = _socket_path_for(
+            self.data_dir, "valkey.sock"
+        )
         self.configfile = os.path.join(self.data_dir, "valkey.conf")
 
     # -- lifecycle -------------------------------------------------------
@@ -109,6 +114,9 @@ class ValkeyServer:
             if self._requested_port is not None
             else _find_free_port(self.host)
         )
+        if self._socket_dir:
+            # A prior stop() removes the fallback socket dir; recreate it.
+            os.makedirs(self._socket_dir, exist_ok=True)
         overrides: Dict[str, Any] = {
             "dbdir": self.data_dir,
             "dbfilename": self.dbfilename,
@@ -232,6 +240,8 @@ class ValkeyServer:
             # Keep the data dir (user-owned or persisted); drop runtime files.
             for path in (self.pidfile, self.socket_file, self.configfile):
                 _safe_remove(path)
+        if self._socket_dir:
+            shutil.rmtree(self._socket_dir, ignore_errors=True)
 
     # -- introspection ---------------------------------------------------
 

@@ -56,7 +56,19 @@ def test_verify_allows_unpinned_with_env(tmp_path, monkeypatch):
     f = tmp_path / "v.tar.gz"
     f.write_bytes(b"data")
     monkeypatch.setenv("VALKEY_ALLOW_UNPINNED", "1")
+    # The bypass is local-dev only; clear CI (set on hosted runners) to
+    # exercise the local-dev path.
+    monkeypatch.delenv("CI", raising=False)
     build_valkey._verify(f, "0.0.0-unpinned")  # bypass allowed for local dev
+
+
+def test_verify_refuses_unpinned_bypass_in_ci(tmp_path, monkeypatch):
+    f = tmp_path / "v.tar.gz"
+    f.write_bytes(b"data")
+    monkeypatch.setenv("VALKEY_ALLOW_UNPINNED", "1")
+    monkeypatch.setenv("CI", "true")
+    with pytest.raises(SystemExit, match="refused when CI"):
+        build_valkey._verify(f, "0.0.0-unpinned")
 
 
 def test_default_version_is_pinned():
