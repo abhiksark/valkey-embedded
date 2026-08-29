@@ -1,7 +1,7 @@
 # Git Workflow
 
-`main` is the default integration and release branch. Normal development uses a
-short-lived branch based on current `origin/main`.
+`dev` is the integration branch and the base for normal development. `main` is the
+release branch.
 
 ## Development
 
@@ -15,7 +15,7 @@ short-lived branch based on current `origin/main`.
    imperative mood (`fix:`, `test:`, `docs:`, `build:`, `ci:`, and so on).
 5. Run targeted tests and required gates, inspect the final diff, then stage exact paths.
    Avoid `git add .` when unrelated files exist.
-6. Commit only after verification. Open a pull request to `main`; link the issue and state
+6. Commit only after verification. Open a pull request to `dev`; link the issue and state
    red-before-green regression evidence for bug fixes.
 
 ## Safety
@@ -32,5 +32,7 @@ short-lived branch based on current `origin/main`.
 
 ## Releases
 
-Release tags are created from a reviewed `main` commit. Version bumps, tags, and pushes
-follow [Release Rules](releases.md) and always require explicit user approval.
+Promote reviewed changes from `dev` to `main` through a release pull request; do not use
+`main` for day-to-day development. Release tags are created from the reviewed `main`
+release commit. Version bumps, tags, and pushes follow
+[Release Rules](releases.md) and always require explicit user approval.
