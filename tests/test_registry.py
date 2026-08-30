@@ -9,6 +9,7 @@ import socket
 import stat
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import types
@@ -430,7 +431,8 @@ def test_tampered_registry_never_adopts_or_signals_live_owner(tmp_path, mutation
 def test_startup_endpoint_mismatch_never_adopts_partial_identity(tmp_path, monkeypatch):
     pidfile = tmp_path / "valkey.pid"
     pidfile.write_text("123")
-    socket_file = str(tmp_path / "valkey.socket")
+    short_dir = tempfile.mkdtemp(prefix="vkey-registry-test-")
+    socket_file = os.path.join(short_dir, "valkey.socket")
     mixin = object.__new__(ValkeyMixin)
     mixin.pidfile = str(pidfile)
     mixin.socket_file = socket_file
@@ -451,10 +453,15 @@ def test_startup_endpoint_mismatch_never_adopts_partial_identity(tmp_path, monke
         },
     )
 
-    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as listener:
-        listener.bind(socket_file)
-        with pytest.raises(_RegistryIdentityMismatch, match="unexpected config file"):
-            mixin._current_managed_identity()
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as listener:
+            listener.bind(socket_file)
+            with pytest.raises(
+                _RegistryIdentityMismatch, match="unexpected config file"
+            ):
+                mixin._current_managed_identity()
+    finally:
+        shutil.rmtree(short_dir, ignore_errors=True)
 
     assert mixin._daemon_identity is None
 
@@ -556,9 +563,10 @@ def test_client_terminate_escalates_only_a_reverified_identity():
     assert calls == ["terminate", "kill"]
 
 
-def test_live_non_valkey_unix_listener_is_preserved_during_recovery(tmp_path):
-    dbfile = str(tmp_path / "listener.db")
-    expected_socket = str(tmp_path / "valkey.socket")
+def test_live_non_valkey_unix_listener_is_preserved_during_recovery():
+    short_dir = tempfile.mkdtemp(prefix="vkey-registry-test-")
+    dbfile = os.path.join(short_dir, "listener.db")
+    expected_socket = os.path.join(short_dir, "valkey.socket")
     listener = _ClosingUnixListener(expected_socket)
     registry = _versioned_stale_registry(dbfile, os.getpid(), expected_socket)
     conn = None
@@ -576,6 +584,7 @@ def test_live_non_valkey_unix_listener_is_preserved_during_recovery(tmp_path):
         if conn is not None:
             conn.close()
         listener.close()
+        shutil.rmtree(short_dir, ignore_errors=True)
 
 
 def test_stale_caller_provided_socket_is_never_removed(tmp_path):

@@ -391,7 +391,7 @@ class ValkeyMixin:
         # kwargs before super().__init__().
         self.socket_file: Optional[str] = kwargs.pop("unix_socket_path", None)
         self._socket_owned = self.socket_file is None
-        self._probe_kwargs = {
+        self._probe_kwargs: Dict[str, Any] = {
             key: kwargs[key]
             for key in ("username", "password", "credential_provider")
             if key in kwargs
