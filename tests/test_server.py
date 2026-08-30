@@ -8,13 +8,18 @@ start/stop/terminate explicitly.
 
 import os
 import socket
+import threading
 
 import psutil
 import pytest
 import valkey
 
 from valkey_embedded import ValkeyServer
-from valkey_embedded.server import ServerStartError, _find_free_port
+from valkey_embedded.server import (
+    ServerStartError,
+    _find_free_port,
+    _StartupIdentityMismatch,
+)
 
 
 def _port_is_listening(host, port):
@@ -75,19 +80,43 @@ def test_stop_before_start_is_idempotent():
     assert not os.path.exists(workdir)
 
 
-def test_wait_until_ready_times_out_after_connection_errors(monkeypatch):
-    server = ValkeyServer()
+def test_wait_until_ready_times_out_after_private_connection_errors(monkeypatch):
+    server = ValkeyServer(port=6380)
+    server.port = 6380
     moments = iter([0.0, 0.0, 1.0])
 
-    def unavailable_client(**_kwargs):
-        raise valkey.exceptions.ConnectionError()
+    class RunningProcess:
+        pid = os.getpid()
 
-    monkeypatch.setattr("valkey_embedded.server.time.monotonic", lambda: next(moments))
+        @staticmethod
+        def poll():
+            return None
+
+    class UnavailableClient:
+        @staticmethod
+        def ping():
+            raise valkey.exceptions.ConnectionError()
+
+        @staticmethod
+        def close():
+            return None
+
+    server._process = RunningProcess()
+    with open(server.pidfile, "w") as fh:
+        fh.write(str(RunningProcess.pid))
+
+    monkeypatch.setattr(
+        "valkey_embedded.server.time.monotonic", lambda: next(moments, 1.0)
+    )
     monkeypatch.setattr("valkey_embedded.server.time.sleep", lambda _seconds: None)
-    monkeypatch.setattr(server, "client", unavailable_client)
+    monkeypatch.setattr(
+        server, "_private_client", lambda **_kwargs: UnavailableClient()
+    )
 
     try:
-        with pytest.raises(ServerStartError, match="failed to start within 0.5s"):
+        with pytest.raises(
+            ServerStartError, match="failed to start and prove daemon identity"
+        ):
             server._wait_until_ready(timeout=0.5)
     finally:
         server.stop()
@@ -128,6 +157,152 @@ def test_auto_port_is_assigned_when_none():
         assert isinstance(server.port, int) and server.port > 0
 
 
+def test_requested_port_collision_rejects_foreign_valkey():
+    first = ValkeyServer()
+    second = None
+    first_client = None
+    try:
+        first.start()
+        first_pid = first.pid
+        first_client = first.client()
+        first_client.set("owner", "first")
+
+        second = ValkeyServer(port=first.port)
+        failed_workdir = second.data_dir
+        with pytest.raises(ServerStartError, match="Address already in use"):
+            second.start(timeout=2.0)
+
+        assert first.is_running()
+        assert first.pid == first_pid
+        assert first_client.get("owner") == b"first"
+        assert second.port is None
+        assert not second.is_running()
+        with pytest.raises(RuntimeError, match="call start"):
+            second.client()
+        assert not os.path.exists(failed_workdir)
+        assert not second._atexit_registered
+    finally:
+        if second is not None:
+            second.stop(timeout=0)
+        if first_client is not None:
+            first_client.close()
+        first.stop(timeout=0)
+
+
+def test_plain_tcp_pong_listener_cannot_satisfy_readiness():
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    listener.bind(("127.0.0.1", 0))
+    listener.listen()
+    listener.settimeout(0.1)
+    port = listener.getsockname()[1]
+    stopping = threading.Event()
+
+    def serve_pong() -> None:
+        while not stopping.is_set():
+            try:
+                connection, _address = listener.accept()
+            except socket.timeout:
+                continue
+            except OSError:
+                return
+            with connection:
+                connection.settimeout(1)
+                try:
+                    connection.recv(4096)
+                    connection.sendall(b"+PONG\r\n")
+                except OSError:
+                    pass
+
+    thread = threading.Thread(target=serve_pong, daemon=True)
+    thread.start()
+    server = ValkeyServer(port=port)
+    failed_workdir = server.data_dir
+    try:
+        with pytest.raises(ServerStartError, match="Address already in use"):
+            server.start(timeout=2.0)
+        assert server.port is None
+        assert not server.is_running()
+        assert not os.path.exists(failed_workdir)
+    finally:
+        server.stop(timeout=0)
+        stopping.set()
+        listener.close()
+        thread.join(timeout=2)
+    assert not thread.is_alive()
+
+
+def test_auto_port_collision_fails_without_adopting_foreign_server(monkeypatch):
+    first = ValkeyServer()
+    second = None
+    try:
+        first.start()
+        monkeypatch.setattr(
+            "valkey_embedded.server._find_free_port", lambda _host: first.port
+        )
+        second = ValkeyServer()
+        failed_workdir = second.data_dir
+
+        with pytest.raises(ServerStartError, match="Address already in use"):
+            second.start(timeout=2.0)
+
+        assert first.is_running()
+        assert second.port is None
+        assert not os.path.exists(failed_workdir)
+    finally:
+        if second is not None:
+            second.stop(timeout=0)
+        first.stop(timeout=0)
+
+
+def test_identity_mismatch_rolls_back_owned_process_and_files(monkeypatch):
+    server = ValkeyServer()
+    failed_workdir = server.data_dir
+    observed_pid = []
+
+    def reject_tcp_identity(identity, _timeout):
+        observed_pid.append(identity.pid)
+        raise _StartupIdentityMismatch("simulated foreign TCP endpoint")
+
+    monkeypatch.setattr(server, "_verify_tcp_identity", reject_tcp_identity)
+
+    try:
+        with pytest.raises(ServerStartError, match="identity mismatch"):
+            server.start(timeout=2.0)
+
+        assert len(observed_pid) == 1
+        assert not psutil.pid_exists(observed_pid[0])
+        assert not os.path.exists(failed_workdir)
+        assert server.port is None
+        assert server.pid == 0
+        assert not server._atexit_registered
+    finally:
+        server.stop(timeout=0)
+
+
+def test_successful_start_proves_private_and_tcp_identity():
+    with ValkeyServer() as server:
+        identity = server._identity
+        assert identity is not None
+        assert identity.pid == server.pid
+        assert server.is_running()
+
+        private_client = valkey.Valkey(unix_socket_path=server.socket_file)
+        tcp_client = server.client()
+        try:
+            private_info = private_client.info("server")
+            tcp_info = tcp_client.info("server")
+        finally:
+            private_client.close()
+            tcp_client.close()
+
+        assert private_info["process_id"] == identity.pid
+        assert tcp_info["process_id"] == identity.pid
+        assert private_info["run_id"] == identity.run_id
+        assert tcp_info["run_id"] == identity.run_id
+        assert private_info["tcp_port"] == server.port
+
+
 def test_multiple_servers_are_independent():
     with ValkeyServer() as a, ValkeyServer() as b:
         assert a.port != b.port
@@ -160,6 +335,32 @@ def test_client_before_start_raises():
 
 
 # -- config / persistence / terminate -----------------------------------
+
+
+@pytest.mark.parametrize(
+    "managed_key",
+    [
+        "bind",
+        "daemonize",
+        "dbdir",
+        "dbfilename",
+        "dir",
+        "include",
+        "logfile",
+        "pidfile",
+        "port",
+        "unixsocket",
+        "unixsocketperm",
+    ],
+)
+def test_managed_runtime_config_overrides_are_rejected(managed_key):
+    with pytest.raises(ValueError, match="managed lifecycle setting"):
+        ValkeyServer(config={managed_key: "caller-value"})
+
+
+def test_managed_runtime_config_override_check_is_case_insensitive():
+    with pytest.raises(ValueError, match="PORT"):
+        ValkeyServer(config={"PORT": "6380"})
 
 
 def test_config_overrides_reach_server():
@@ -216,11 +417,23 @@ def test_stop_cleans_up_when_graceful_shutdown_raises(monkeypatch):
     shutdown_calls = []
 
     class FailingClient:
+        @staticmethod
+        def info(_section):
+            assert server._identity is not None
+            return {
+                "process_id": server._identity.pid,
+                "run_id": server._identity.run_id,
+            }
+
         def shutdown(self, **kwargs):
             shutdown_calls.append(kwargs)
             raise RuntimeError("simulated shutdown failure")
 
-    monkeypatch.setattr(server, "client", lambda **_kwargs: FailingClient())
+        @staticmethod
+        def close():
+            return None
+
+    monkeypatch.setattr(server, "_private_client", lambda **_kwargs: FailingClient())
 
     try:
         server.stop(timeout=0)

@@ -9,6 +9,9 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ### Fixed
 
+- `ValkeyServer.start()` now proves PID, private-socket, and TCP run identity
+  before reporting readiness, so an occupied port cannot attach callers to an
+  unrelated Valkey or fake listener; failed attempts clean up owned state.
 - `Valkey.close()` now stops the embedded server when the last client closes,
   releases its connection pool, and cleans up owned runtime files immediately.
 

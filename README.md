@@ -117,6 +117,11 @@ and `make`). Windows is unsupported (WSL works).
 
   Explicit form: `server = ValkeyServer(); server.start(); ...; server.stop()`
   (`is_running()`, `terminate()`, `persist=True`, `data_dir=…`, `config={…}` too).
+  `start()` returns only after the launched PID, private Unix socket, and public
+  TCP endpoint report the same Valkey run identity. An occupied requested port
+  raises `ServerStartError`; it is never mistaken for or attached as this server.
+  Endpoint/path directives such as `port`, `bind`, `pidfile`, and `unixsocket`
+  are managed by the constructor and cannot be replaced through `config`.
 
   > `Valkey()` stays unix-socket-only with no TCP listener (private by default);
   > reach for `ValkeyServer` when you need a port.

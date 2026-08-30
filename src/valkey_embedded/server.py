@@ -1,4 +1,3 @@
-# src/valkey_embedded/server.py
 """Explicit valkey-server lifecycle control with a TCP endpoint.
 
 `Valkey()` is the auto-managed client: it starts a private, unix-socket-only
@@ -7,8 +6,9 @@ of the API -- explicit start/stop control over a server that also listens on
 TCP, so *any* Redis-compatible client (or another process, or a non-Python
 tool) can connect via host/port.
 
-Hard-won lifecycle details mirror client.py: the daemon pid is read from the
-pidfile (never a reset self-pid), and shutdown is graceful-then-terminate.
+A successful start proves that the direct child process, private Unix socket,
+pidfile, and public TCP endpoint all identify the same Valkey run. Endpoint
+reachability alone is never treated as ownership.
 """
 
 from __future__ import annotations
@@ -20,7 +20,8 @@ import socket
 import subprocess
 import tempfile
 import time
-from typing import Any, Dict, Optional
+from dataclasses import dataclass
+from typing import Any, Dict, Optional, Set, cast
 
 import psutil
 import valkey
@@ -35,6 +36,46 @@ from valkey_embedded.client import (
 )
 
 DEFAULT_START_TIMEOUT = 10.0
+_LOG_TAIL_BYTES = 4096
+_PROBE_INTERVAL = 0.1
+
+# These settings define process ownership or public object state. Letting an
+# arbitrary config entry replace one would make paths, PID, or endpoint metadata
+# disagree with the daemon that ValkeyServer manages. ``include`` is reserved
+# because an included file could override every other managed directive.
+_MANAGED_CONFIG_KEYS = frozenset(
+    {
+        "bind",
+        "daemonize",
+        "dbdir",
+        "dbfilename",
+        "dir",
+        "include",
+        "logfile",
+        "pidfile",
+        "port",
+        "unixsocket",
+        "unixsocketperm",
+    }
+)
+_SECRET_CONFIG_KEYS = frozenset({"masterauth", "requirepass"})
+
+
+@dataclass(frozen=True)
+class _DaemonIdentity:
+    """Identity proven across the child process and both server endpoints."""
+
+    pid: int
+    create_time: float
+    run_id: str
+
+
+class _StartupNotReady(Exception):
+    """A startup identity component is not observable yet."""
+
+
+class _StartupIdentityMismatch(Exception):
+    """Observed startup components identify different processes or runs."""
 
 
 def _find_free_port(host: str = "127.0.0.1") -> int:
@@ -73,9 +114,15 @@ class ValkeyServer:
             data_dir: Working directory. None creates a temp dir that is removed
                 on stop (unless ``persist``).
             config: valkey.conf overrides (e.g. ``{"maxmemory": "100mb"}``).
+                Process identity, endpoint, and managed path directives cannot
+                be overridden here; use the corresponding constructor argument.
             persist: Keep the data directory and save the RDB on stop.
             **config_overrides: Additional valkey.conf overrides, merged after
                 ``config``.
+
+        Raises:
+            ValueError: A config override attempts to replace a lifecycle setting
+                managed by ``ValkeyServer``.
         """
         self.host = host
         self._requested_port = port
@@ -83,7 +130,11 @@ class ValkeyServer:
         self.persist = persist
         self._config: Dict[str, Any] = dict(config or {})
         self._config.update(config_overrides)
+        self._validate_config_overrides()
+
         self._process: Optional[subprocess.Popen[bytes]] = None
+        self._process_create_time: Optional[float] = None
+        self._identity: Optional[_DaemonIdentity] = None
         self._atexit_registered = False
 
         self._owns_dir = data_dir is None
@@ -103,141 +154,506 @@ class ValkeyServer:
         )
         self.configfile = os.path.join(self.data_dir, "valkey.conf")
 
+    def _validate_config_overrides(self) -> None:
+        """Reject config keys that could desynchronize managed lifecycle state."""
+        invalid = sorted(
+            key for key in self._config if key.lower() in _MANAGED_CONFIG_KEYS
+        )
+        if invalid:
+            raise ValueError(
+                "config overrides managed lifecycle setting(s): {0}; use the "
+                "ValkeyServer constructor arguments instead".format(", ".join(invalid))
+            )
+
     # -- lifecycle -------------------------------------------------------
 
     def start(self, timeout: float = DEFAULT_START_TIMEOUT) -> None:
-        """Start the server and block until it answers PING (or time out)."""
+        """Start and prove the identity of this instance's daemon.
+
+        Readiness is established first through this instance's private Unix
+        socket, then by matching the run ID and PID over its public TCP endpoint.
+        A foreign process listening on the requested port cannot satisfy start.
+
+        Args:
+            timeout: Maximum seconds to wait for the identity proof.
+
+        Raises:
+            ServerStartError: The process exits, times out, or cannot prove that
+                its private and public endpoints belong to this launch.
+            ValueError: ``timeout`` is negative.
+        """
+        if timeout < 0:
+            raise ValueError("timeout must be non-negative")
         if self.is_running():
             return
+
+        self._identity = None
+        self._process = None
+        self._process_create_time = None
         self.port = (
             self._requested_port
             if self._requested_port is not None
             else _find_free_port(self.host)
         )
+
+        os.makedirs(self.data_dir, exist_ok=True)
         if self._socket_dir:
             # A prior stop() removes the fallback socket dir; recreate it.
-            os.makedirs(self._socket_dir, exist_ok=True)
+            os.makedirs(self._socket_dir, mode=0o700, exist_ok=True)
+
+        runtime_paths = {
+            self.pidfile,
+            self.socket_file,
+            self.configfile,
+            self.logfile,
+        }
+        preexisting_files = {path for path in runtime_paths if os.path.exists(path)}
+
+        try:
+            self._prepare_runtime_paths()
+            # Stale runtime paths removed by preparation are not caller files to
+            # preserve if this attempt recreates them and then fails.
+            preexisting_files = {path for path in runtime_paths if os.path.exists(path)}
+            self._write_config()
+            self._launch_process()
+            self._register_atexit()
+            self._wait_until_ready(timeout)
+        except BaseException:
+            # Roll back only the process and files acquired by this attempt.
+            # BaseException is deliberate: KeyboardInterrupt/SystemExit must not
+            # strand a direct child process or atexit callback.
+            self._rollback_failed_start(preexisting_files)
+            raise
+
+    def _prepare_runtime_paths(self) -> None:
+        """Refuse live runtime state and remove only demonstrably stale files."""
+        recorded_pid = self._read_pidfile()
+        if recorded_pid and psutil.pid_exists(recorded_pid):
+            raise ServerStartError(
+                "refusing to start: managed pidfile {0} identifies live process "
+                "{1}; use a different data_dir or stop its owner first".format(
+                    self.pidfile, recorded_pid
+                )
+            )
+        _safe_remove(self.pidfile)
+
+        if os.path.exists(self.socket_file):
+            probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            probe.settimeout(0.2)
+            try:
+                probe.connect(self.socket_file)
+            except OSError:
+                _safe_remove(self.socket_file)
+            else:
+                raise ServerStartError(
+                    "refusing to start: managed Unix socket {0} is already "
+                    "accepting connections".format(self.socket_file)
+                )
+            finally:
+                probe.close()
+
+    def _write_config(self) -> None:
+        """Render a private config whose identity settings cannot be replaced."""
+        assert self.port is not None
         overrides: Dict[str, Any] = {
+            "bind": self.host,
+            "daemonize": "no",
             "dbdir": self.data_dir,
             "dbfilename": self.dbfilename,
-            "pidfile": self.pidfile,
             "logfile": self.logfile,
-            "unixsocket": self.socket_file,
+            "pidfile": self.pidfile,
             "port": str(self.port),
-            "bind": self.host,
+            "unixsocket": self.socket_file,
+            "unixsocketperm": "700",
         }
         overrides.update(self._config)
-        with open(self.configfile, "w") as fh:
-            fh.write(configuration.config(**overrides))
+        rendered = configuration.config(**overrides)
+        fd = os.open(
+            self.configfile,
+            os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
+            0o600,
+        )
+        try:
+            os.fchmod(fd, 0o600)
+            with os.fdopen(fd, "w") as fh:
+                fd = -1
+                fh.write(rendered)
+        finally:
+            if fd >= 0:
+                os.close(fd)
 
+    def _launch_process(self) -> None:
+        """Launch Valkey as a direct child and capture its anti-reuse identity."""
         executable = valkey_embedded.__valkey_executable__
         if not executable or not os.path.exists(executable):
             raise ServerStartError(_missing_binary_message(executable))
-        self._process = subprocess.Popen(
-            [executable, self.configfile],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-        # daemonize yes: the launcher forks the server and exits; reap it.
         try:
-            self._process.wait(timeout=timeout)
-        except subprocess.TimeoutExpired:  # pragma: no cover - daemon exits fast
-            pass
-
-        atexit.register(self.stop)
-        self._atexit_registered = True
-        self._wait_until_ready(timeout)
+            process = subprocess.Popen(
+                [executable, self.configfile],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except OSError as exc:
+            raise ServerStartError(
+                "could not launch bundled valkey-server at {0!r}: {1}".format(
+                    executable, exc
+                )
+            ) from exc
+        self._process = process
+        try:
+            self._process_create_time = psutil.Process(process.pid).create_time()
+        except psutil.NoSuchProcess:
+            # The readiness loop reports the direct child's exit status and log.
+            process.poll()
 
     def _wait_until_ready(self, timeout: float) -> None:
-        """Poll PING until the server answers or ``timeout`` expires."""
+        """Prove process, pidfile, private socket, and TCP endpoint identity."""
         deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
+        last_probe = "private Unix socket is not ready"
+
+        while True:
+            process = self._process
+            if process is None:
+                raise self._startup_error("valkey-server process was not launched")
+            returncode = process.poll()
+            if returncode is not None:
+                raise self._startup_error(
+                    "valkey-server exited with status {0} before startup identity "
+                    "was verified".format(returncode)
+                )
+
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            probe_timeout = max(0.01, min(1.0, remaining))
             try:
-                probe = self.client(socket_connect_timeout=1)
-                try:
-                    if probe.ping():
-                        return
-                finally:
-                    # valkey-py's close() is untyped; harmless to call.
-                    probe.close()  # type: ignore[no-untyped-call]
-            except valkey.exceptions.ConnectionError:
-                pass
-            time.sleep(0.1)
-        raise ServerStartError(
-            "valkey-server failed to start within {0}s; see log at {1}".format(
-                timeout, self.logfile
-            )
+                identity = self._probe_private_identity(probe_timeout)
+                self._verify_tcp_identity(identity, probe_timeout)
+                if self._matching_process(identity.pid, identity.create_time) is None:
+                    raise _StartupIdentityMismatch(
+                        "the launched PID changed or exited during readiness"
+                    )
+            except _StartupNotReady as exc:
+                last_probe = str(exc)
+            except _StartupIdentityMismatch as exc:
+                raise self._startup_error(
+                    "valkey-server startup identity mismatch: {0}".format(exc)
+                ) from exc
+            else:
+                self._identity = identity
+                return
+
+            sleep_for = min(_PROBE_INTERVAL, max(0.0, deadline - time.monotonic()))
+            if sleep_for:
+                time.sleep(sleep_for)
+
+        raise self._startup_error(
+            "valkey-server failed to start and prove daemon identity within "
+            "{0}s; last probe: {1}".format(timeout, last_probe)
         )
 
+    def _probe_private_identity(self, timeout: float) -> _DaemonIdentity:
+        """Read and validate identity through this instance's Unix socket."""
+        process = self._process
+        if process is None:
+            raise _StartupNotReady("direct child process is unavailable")
+
+        recorded_pid = self._read_pidfile()
+        if not recorded_pid:
+            raise _StartupNotReady("managed pidfile is not ready")
+        if recorded_pid != process.pid:
+            raise _StartupIdentityMismatch(
+                "pidfile PID {0} does not match launched PID {1}".format(
+                    recorded_pid, process.pid
+                )
+            )
+
+        probe = self._private_client(
+            socket_connect_timeout=timeout,
+            socket_timeout=timeout,
+        )
+        try:
+            if not probe.ping():
+                raise _StartupNotReady("private Unix socket did not answer PING")
+            info = cast(Dict[str, Any], probe.info("server"))
+        except valkey.exceptions.ValkeyError as exc:
+            raise _StartupNotReady(
+                "private Unix socket is not ready: {0}".format(exc)
+            ) from exc
+        finally:
+            probe.close()  # type: ignore[no-untyped-call]
+
+        try:
+            info_pid = int(info["process_id"])
+            info_port = int(info["tcp_port"])
+            run_id = str(info["run_id"])
+            config_file = str(info["config_file"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise _StartupIdentityMismatch(
+                "private endpoint returned incomplete server identity"
+            ) from exc
+        if info_pid != process.pid:
+            raise _StartupIdentityMismatch(
+                "private endpoint PID {0} does not match launched PID {1}".format(
+                    info_pid, process.pid
+                )
+            )
+        if info_port != self.port:
+            raise _StartupIdentityMismatch(
+                "private endpoint reports TCP port {0}, expected {1}".format(
+                    info_port, self.port
+                )
+            )
+        if not run_id:
+            raise _StartupIdentityMismatch("private endpoint returned an empty run ID")
+        if os.path.realpath(config_file) != os.path.realpath(self.configfile):
+            raise _StartupIdentityMismatch(
+                "private endpoint reports unexpected config file {0!r}".format(
+                    config_file
+                )
+            )
+
+        create_time = self._process_create_time
+        if create_time is None:
+            try:
+                create_time = psutil.Process(process.pid).create_time()
+            except psutil.NoSuchProcess as exc:
+                raise _StartupNotReady("launched process exited") from exc
+            self._process_create_time = create_time
+        if self._matching_process(process.pid, create_time) is None:
+            raise _StartupIdentityMismatch(
+                "launched process creation identity no longer matches"
+            )
+        return _DaemonIdentity(process.pid, create_time, run_id)
+
+    def _verify_tcp_identity(self, identity: _DaemonIdentity, timeout: float) -> None:
+        """Require the public TCP endpoint to report the private run identity."""
+        probe = self._tcp_client(
+            socket_connect_timeout=timeout,
+            socket_timeout=timeout,
+        )
+        try:
+            if not probe.ping():
+                raise _StartupNotReady("TCP endpoint did not answer PING")
+            info = cast(Dict[str, Any], probe.info("server"))
+        except valkey.exceptions.ValkeyError as exc:
+            raise _StartupNotReady(
+                "TCP endpoint is not ready: {0}".format(exc)
+            ) from exc
+        finally:
+            probe.close()  # type: ignore[no-untyped-call]
+
+        try:
+            tcp_pid = int(info["process_id"])
+            tcp_run_id = str(info["run_id"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise _StartupIdentityMismatch(
+                "TCP endpoint returned incomplete server identity"
+            ) from exc
+        if tcp_pid != identity.pid or tcp_run_id != identity.run_id:
+            raise _StartupIdentityMismatch(
+                "TCP endpoint belongs to PID/run ID {0}/{1}, expected {2}/{3}".format(
+                    tcp_pid,
+                    tcp_run_id,
+                    identity.pid,
+                    identity.run_id,
+                )
+            )
+
+    def _startup_error(self, reason: str) -> ServerStartError:
+        """Create an actionable bounded error before failed files are removed."""
+        assert self.port is not None
+        message = "{0} for {1}:{2}".format(reason, self.host, self.port)
+        log_tail = self._redacted_log_tail()
+        if log_tail:
+            message += "\nvalkey.log tail ({0}):\n{1}".format(self.logfile, log_tail)
+        else:
+            message += "; no valkey log output was captured at {0}".format(self.logfile)
+        return ServerStartError(message)
+
+    def _redacted_log_tail(self) -> str:
+        """Return a bounded startup log tail with configured secrets removed."""
+        try:
+            with open(self.logfile, "rb") as fh:
+                fh.seek(0, os.SEEK_END)
+                size = fh.tell()
+                fh.seek(max(0, size - _LOG_TAIL_BYTES))
+                tail = fh.read(_LOG_TAIL_BYTES).decode("utf-8", errors="replace")
+        except OSError:
+            return ""
+
+        for key, value in self._config.items():
+            if key.lower() not in _SECRET_CONFIG_KEYS:
+                continue
+            values = value if isinstance(value, list) else [value]
+            for secret in values:
+                if secret:
+                    tail = tail.replace(str(secret), "<redacted>")
+        return tail.strip()
+
+    def _rollback_failed_start(self, preexisting_files: Set[str]) -> None:
+        """Terminate only this attempt's child and remove its acquired state."""
+        process = self._process
+        create_time = self._process_create_time
+        if process is not None and create_time is not None:
+            self._terminate_process(process.pid, create_time, timeout=0)
+        elif process is not None:
+            # poll() identifies whether this exact child is still waitable. If
+            # alive, capture creation time before signalling to prevent PID reuse.
+            if process.poll() is None:
+                try:
+                    create_time = psutil.Process(process.pid).create_time()
+                except psutil.NoSuchProcess:
+                    create_time = None
+                if create_time is not None:
+                    self._terminate_process(process.pid, create_time, timeout=0)
+
+        if process is not None:
+            try:
+                process.wait(timeout=0)
+            except subprocess.TimeoutExpired:
+                pass
+
+        if self._owns_dir:
+            # A failed attempt never commits persistence ownership, even when
+            # persist=True; its automatically-created directory is disposable.
+            shutil.rmtree(self.data_dir, ignore_errors=True)
+        else:
+            for path in (
+                self.pidfile,
+                self.socket_file,
+                self.configfile,
+                self.logfile,
+            ):
+                if path not in preexisting_files:
+                    _safe_remove(path)
+        if self._socket_dir:
+            shutil.rmtree(self._socket_dir, ignore_errors=True)
+
+        self._unregister_atexit()
+        self._reset_runtime_state()
+
     def stop(self, timeout: float = 5.0) -> None:
-        """Gracefully shut the server down and clean up runtime files."""
-        pid = self.pid
-        if pid:
+        """Gracefully shut down the verified server and clean runtime files."""
+        identity = self._identity
+        if identity is not None and self._matching_process(
+            identity.pid, identity.create_time
+        ):
             try:
-                probe = self.client(socket_connect_timeout=1)
-                if self.persist:
-                    probe.shutdown(save=True)
-                else:
-                    probe.shutdown(nosave=True)
-            except Exception:  # noqa: BLE001 - server closes the socket on shutdown
+                probe = self._private_client(
+                    socket_connect_timeout=1,
+                    socket_timeout=1,
+                )
+                try:
+                    info = cast(Dict[str, Any], probe.info("server"))
+                    endpoint_matches = (
+                        int(info["process_id"]) == identity.pid
+                        and str(info["run_id"]) == identity.run_id
+                    )
+                    if endpoint_matches:
+                        if self.persist:
+                            probe.shutdown(save=True)
+                        else:
+                            probe.shutdown(nosave=True)
+                finally:
+                    probe.close()  # type: ignore[no-untyped-call]
+            except Exception:  # noqa: BLE001 - shutdown closes its own socket
                 pass
-            self._terminate(pid, timeout)
+            self._terminate_process(identity.pid, identity.create_time, timeout)
+
         self._cleanup_files()
-        self.port = None
-        if self._atexit_registered:
-            try:
-                atexit.unregister(self.stop)
-            except Exception:  # noqa: BLE001
-                pass
-            self._atexit_registered = False
+        self._unregister_atexit()
+        self._reset_runtime_state()
 
     def terminate(self) -> None:
-        """Kill the server immediately (no save), then clean up.
+        """Kill the verified server immediately (no save), then clean up."""
+        identity = self._identity
+        if identity is not None:
+            process = self._matching_process(identity.pid, identity.create_time)
+            if process is not None:
+                try:
+                    process.kill()
+                    process.wait(timeout=5)
+                except (psutil.NoSuchProcess, psutil.TimeoutExpired):
+                    pass
 
-        Waits for the daemon to actually exit before returning, so callers can
-        rely on the pid being gone.
-        """
-        pid = self.pid
-        if pid:
-            try:
-                proc = psutil.Process(pid)
-                proc.kill()
-                proc.wait(timeout=5)  # reap; works for the reparented daemon too
-            except (psutil.NoSuchProcess, psutil.TimeoutExpired):
-                pass
         self._cleanup_files()
-        self.port = None
+        self._unregister_atexit()
+        self._reset_runtime_state()
 
-    def _terminate(self, pid: int, timeout: float) -> None:
-        """Wait for the daemon to exit, escalating to SIGTERM then SIGKILL."""
-        if not pid:
+    def _terminate_process(self, pid: int, create_time: float, timeout: float) -> None:
+        """Stop one creation-time-verified process with bounded escalation."""
+        if pid <= 0:
             return
-        try:
-            proc = psutil.Process(pid)
-        except psutil.NoSuchProcess:
-            return
-        deadline = time.monotonic() + timeout
+        deadline = time.monotonic() + max(0.0, timeout)
         while time.monotonic() < deadline:
-            if not proc.is_running():
+            if self._matching_process(pid, create_time) is None:
                 return
-            time.sleep(0.1)
+            time.sleep(min(_PROBE_INTERVAL, deadline - time.monotonic()))
+
+        process = self._matching_process(pid, create_time)
+        if process is None:
+            return
         try:
-            proc.terminate()
-            proc.wait(timeout=5)
+            process.terminate()
+            process.wait(timeout=5)
         except (psutil.NoSuchProcess, psutil.TimeoutExpired):
             pass
-        if proc.is_running():
+
+        process = self._matching_process(pid, create_time)
+        if process is not None:
             try:
-                proc.kill()
-            except psutil.NoSuchProcess:
+                process.kill()
+                process.wait(timeout=5)
+            except (psutil.NoSuchProcess, psutil.TimeoutExpired):
                 pass
 
+    def _matching_process(
+        self, pid: int, create_time: float
+    ) -> Optional[psutil.Process]:
+        """Return the direct child only while its anti-reuse identity matches."""
+        process = self._process
+        if process is None or process.pid != pid or process.poll() is not None:
+            return None
+        try:
+            candidate = psutil.Process(pid)
+            if candidate.create_time() != create_time:
+                return None
+            if not candidate.is_running() or candidate.status() == psutil.STATUS_ZOMBIE:
+                return None
+        except psutil.NoSuchProcess:
+            return None
+        return candidate
+
+    def _register_atexit(self) -> None:
+        """Register one fallback callback for a launched process."""
+        if not self._atexit_registered:
+            atexit.register(self.stop)
+            self._atexit_registered = True
+
+    def _unregister_atexit(self) -> None:
+        """Remove this instance's fallback callback if registered."""
+        if not self._atexit_registered:
+            return
+        try:
+            atexit.unregister(self.stop)
+        except Exception:  # noqa: BLE001 - best-effort interpreter cleanup
+            pass
+        self._atexit_registered = False
+
+    def _reset_runtime_state(self) -> None:
+        """Clear per-run state only after process responsibility is resolved."""
+        self.port = None
+        self._identity = None
+        self._process = None
+        self._process_create_time = None
+
     def _cleanup_files(self) -> None:
-        """Remove the temp dir (if ours) or just the runtime files."""
+        """Remove the temp dir (if ours) or just the managed runtime files."""
         if self._owns_dir and not self.persist:
             shutil.rmtree(self.data_dir, ignore_errors=True)
         else:
-            # Keep the data dir (user-owned or persisted); drop runtime files.
+            # Keep caller-owned or persisted data and logs; drop runtime files.
             for path in (self.pidfile, self.socket_file, self.configfile):
                 _safe_remove(path)
         if self._socket_dir:
@@ -245,30 +661,47 @@ class ValkeyServer:
 
     # -- introspection ---------------------------------------------------
 
-    @property
-    def pid(self) -> int:
-        """Daemon pid from the pidfile, or 0 if not running."""
+    def _read_pidfile(self) -> int:
+        """Return the unverified positive pidfile value, or zero."""
         try:
             with open(self.pidfile) as fh:
                 pid = int(fh.read().strip())
         except (OSError, ValueError):
             return 0
-        return pid if psutil.pid_exists(pid) else 0
+        return pid if pid > 0 else 0
+
+    @property
+    def pid(self) -> int:
+        """Verified daemon PID, or zero when its creation identity is not live."""
+        identity = self._identity
+        if identity is None:
+            return 0
+        if self._matching_process(identity.pid, identity.create_time) is None:
+            return 0
+        return identity.pid
 
     def is_running(self) -> bool:
-        """True if the server was started and its daemon pid is alive."""
+        """Return whether the identity-proven direct child is still running."""
         return self.port is not None and self.pid != 0
 
+    def _private_client(self, **kwargs: Any) -> valkey.Valkey:
+        """Return an internal client for this instance's private Unix socket."""
+        return valkey.Valkey(unix_socket_path=self.socket_file, **kwargs)
+
+    def _tcp_client(self, **kwargs: Any) -> valkey.Valkey:
+        """Return an unchecked TCP client used only during identity proof."""
+        assert self.port is not None
+        return valkey.Valkey(host=self.host, port=self.port, **kwargs)
+
     def client(self, **kwargs: Any) -> valkey.Valkey:
-        """Return a valkey-py client connected to this server over TCP."""
-        if self.port is None:
-            # Misuse, not a start failure -- hence RuntimeError, not
-            # ServerStartError.
+        """Return a TCP client only while this server's identity is live."""
+        if not self.is_running():
+            # Misuse or a dead owned process, not a new start failure.
             raise RuntimeError(
                 "server is not running; call start() first or use "
                 "ValkeyServer as a context manager"
             )
-        return valkey.Valkey(host=self.host, port=self.port, **kwargs)
+        return self._tcp_client(**kwargs)
 
     @property
     def connection_kwargs(self) -> Dict[str, Any]:
