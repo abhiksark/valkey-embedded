@@ -17,6 +17,7 @@ import time
 
 import psutil
 import pytest
+import valkey
 from valkey.exceptions import TimeoutError as ValkeyTimeoutError
 
 from valkey_embedded import Valkey
@@ -139,12 +140,31 @@ def test_shared_close_keeps_server_until_last_client(tmp_path, monkeypatch):
     assert shutdown_calls == [((), {"save": True})]
 
 
+def test_unmanaged_connection_does_not_claim_shared_lifecycle(tmp_path):
+    dbfile = str(tmp_path / "managed.db")
+    conn = Valkey(dbfile)
+    pid = conn.pid
+    external = valkey.Valkey(unix_socket_path=conn.socket_file)
+    try:
+        assert external.ping() is True
+
+        conn.close()
+
+        assert _wait_dead(pid)
+        with pytest.raises(valkey.exceptions.ConnectionError):
+            external.ping()
+    finally:
+        external.close()
+        if conn.running:
+            conn.close()
+
+
 def test_shared_close_retries_after_ownership_check_failure(tmp_path, monkeypatch):
     dbfile = str(tmp_path / "retry.db")
     registry = dbfile + ".settings"
     conn = Valkey(dbfile)
     pid = conn.pid
-    connection_count = conn._connection_count
+    release_holder = conn._release_registry_holder
     unregister = atexit.unregister
     unregister_calls = []
     attempts = 0
@@ -153,18 +173,18 @@ def test_shared_close_retries_after_ownership_check_failure(tmp_path, monkeypatc
         nonlocal attempts
         attempts += 1
         if attempts == 1:
-            raise ValkeyTimeoutError("simulated CLIENT LIST timeout")
-        return connection_count()
+            raise ValkeyTimeoutError("simulated registry update timeout")
+        return release_holder()
 
     def tracked_unregister(callback):
         unregister_calls.append(callback)
         return unregister(callback)
 
-    monkeypatch.setattr(conn, "_connection_count", fail_once)
+    monkeypatch.setattr(conn, "_release_registry_holder", fail_once)
     monkeypatch.setattr(atexit, "unregister", tracked_unregister)
 
     try:
-        with pytest.raises(ValkeyTimeoutError, match="CLIENT LIST timeout"):
+        with pytest.raises(ValkeyTimeoutError, match="registry update timeout"):
             conn.close()
 
         assert conn.running is True
@@ -181,7 +201,7 @@ def test_shared_close_retries_after_ownership_check_failure(tmp_path, monkeypatc
         assert len(unregister_calls) == 1
     finally:
         if conn.running:
-            monkeypatch.setattr(conn, "_connection_count", connection_count)
+            monkeypatch.setattr(conn, "_release_registry_holder", release_holder)
             conn.close()
 
 

@@ -77,7 +77,13 @@ and `make`). Windows is unsupported (WSL works).
 
 - **Isolated server:** `Valkey()` — a private server per instance.
 - **Persistent / shared:** `Valkey("/path/to/db.rdb")` — persists across runs;
-  instances sharing the path attach to one server (last to close shuts it down).
+  instances sharing the path attach to one server (last managed holder to close
+  shuts it down). Cross-process attachment uses a private, atomically updated
+  registry that verifies the daemon PID creation time, bundled executable, Unix
+  endpoint, config path, and Valkey run ID. Dead process holders are pruned;
+  malformed or mismatched registries never authorize attachment or signalling.
+  The adjacent `.settings` and `.settings.lock` files are managed runtime state
+  and should not be edited.
 
   > Note: the first positional argument is the **RDB file path**, not `host` — the
   > embedded server has no host. Pass server overrides via
