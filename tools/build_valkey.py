@@ -18,6 +18,7 @@ import hashlib
 import json
 import os
 import shutil
+import stat
 import subprocess
 import tarfile
 import tempfile
@@ -153,19 +154,85 @@ def _project_version() -> str:
     return "0.0.0"
 
 
+def _license_markers(version: str) -> tuple[str, ...]:
+    """Required notice headers in the generated third-party license bundle."""
+    return (
+        "----- COPYING (Valkey {0}) -----".format(version),
+        "----- deps/lua/COPYRIGHT (Valkey {0}) -----".format(version),
+        "----- deps/hdr_histogram/LICENSE.txt (Valkey {0}) -----".format(version),
+        "----- deps/fpconv/LICENSE.txt (Valkey {0}) -----".format(version),
+        (
+            "----- deps/linenoise/linenoise.c license header (Valkey {0}) -----".format(
+                version
+            )
+        ),
+    )
+
+
+def _license_bundle_complete(bundle: str, version: str) -> bool:
+    """Return whether every expected notice has substantial license text."""
+    markers = _license_markers(version)
+    positions = [bundle.find(marker) for marker in markers]
+    if any(position < 0 for position in positions) or positions != sorted(positions):
+        return False
+    for index, marker in enumerate(markers):
+        start = positions[index] + len(marker)
+        end = positions[index + 1] if index + 1 < len(markers) else len(bundle)
+        if len(bundle[start:end].strip()) < 500:
+            return False
+    return True
+
+
 def _is_current(target: Path, metadata_path: str, version: str) -> bool:
-    """True if the built binary for this Valkey version is already in place."""
+    """Return whether all cached generated inputs are safe to reuse."""
     if os.environ.get("VALKEY_FORCE_REBUILD") == "1":
         return False
     server = target / "valkey-server"
-    if not server.exists():
+    cli = target / "valkey-cli"
+    license_bundle = target / "VALKEY_COPYING.txt"
+    generated_files = (server, cli, license_bundle)
+    if not all(path.is_file() and not path.is_symlink() for path in generated_files):
         return False
     try:
+        if not all(
+            stat.S_IMODE(path.stat().st_mode) == 0o755 for path in (server, cli)
+        ):
+            return False
         with open(metadata_path) as fh:
             existing = json.load(fh)
-    except (OSError, ValueError):
+        licenses = license_bundle.read_text()
+        server_banner = _server_version(server)
+        cli_banner = subprocess.check_output([str(cli), "--version"], text=True).strip()
+    except (OSError, ValueError, subprocess.SubprocessError):
         return False
-    return existing.get("valkey_server_version") == version
+    if not isinstance(existing, dict):
+        return False
+    if set(existing) != {
+        "valkey_embedded_version",
+        "valkey_server_version",
+        "valkey_server_banner",
+        "valkey_executable",
+    }:
+        return False
+    return (
+        existing.get("valkey_server_version") == version
+        and existing.get("valkey_executable") == "bin/valkey-server"
+        and "v=" + version in server_banner
+        and cli_banner == "valkey-cli " + version
+        and _license_bundle_complete(licenses, version)
+    )
+
+
+def _write_metadata(metadata_path: str, version: str, version_line: str) -> None:
+    """Write exact, package-relative metadata for the current project build."""
+    metadata = {
+        "valkey_embedded_version": _project_version(),
+        "valkey_server_version": version,
+        "valkey_server_banner": version_line,
+        "valkey_executable": "bin/valkey-server",
+    }
+    with open(metadata_path, "w") as fh:
+        json.dump(metadata, fh, indent=2)
 
 
 def build(
@@ -176,6 +243,10 @@ def build(
     """Build Valkey and place valkey-server/valkey-cli in target_bin_dir."""
     target = Path(target_bin_dir)
     if _is_current(target, metadata_path, version):
+        version_line = _server_version(target / "valkey-server")
+        # The binary can span package releases, but generated project metadata
+        # cannot: always refresh it before setuptools collects package data.
+        _write_metadata(metadata_path, version, version_line)
         print("Reusing existing valkey-server {0} (cached build)".format(version))
         return
     _preflight()
@@ -205,35 +276,29 @@ def build(
             for rel in license_sources:
                 lic = src_dir / rel
                 if not lic.exists():
-                    print("NOTE: license file missing from tarball: " + rel)
-                    continue
+                    raise SystemExit("ERROR: license file missing from tarball: " + rel)
                 bundle.write("----- {0} (Valkey {1}) -----\n".format(rel, version))
                 bundle.write(lic.read_text())
                 bundle.write("\n")
             # linenoise (used by the bundled valkey-cli) ships its BSD-2
             # license only as the leading comment of its source file.
             linenoise = src_dir / "deps" / "linenoise" / "linenoise.c"
-            if linenoise.exists():
-                header = linenoise.read_text().split("*/", 1)[0] + "*/"
-                bundle.write(
-                    "----- deps/linenoise/linenoise.c license header "
-                    "(Valkey {0}) -----\n".format(version)
+            if not linenoise.exists():
+                raise SystemExit(
+                    "ERROR: license source missing from tarball: " + str(linenoise)
                 )
-                bundle.write(header)
-                bundle.write("\n")
+            header = linenoise.read_text().split("*/", 1)[0] + "*/"
+            bundle.write(
+                "----- deps/linenoise/linenoise.c license header "
+                "(Valkey {0}) -----\n".format(version)
+            )
+            bundle.write(header)
+            bundle.write("\n")
         server = target / "valkey-server"
         version_line = _server_version(server)
 
-    metadata = {
-        "valkey_embedded_version": _project_version(),
-        "valkey_server_version": version,
-        "valkey_server_banner": version_line,
-        # Package-relative: resolved against the package dir at import time
-        # (an absolute path would bake the build host's tree into the wheel).
-        "valkey_executable": "bin/valkey-server",
-    }
-    with open(metadata_path, "w") as fh:
-        json.dump(metadata, fh, indent=2)
+    # Package-relative metadata keeps build-host paths out of wheels.
+    _write_metadata(metadata_path, version, version_line)
     print("Built {0} -> {1}".format(version_line, server))
 
 

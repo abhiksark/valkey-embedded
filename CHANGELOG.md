@@ -28,6 +28,8 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
   recover safely after holder processes exit.
 - `Valkey.close()` now releases its connection pool and cleans up owned runtime
   files immediately when the last managed holder closes.
+- Wheel builds now discard stale setuptools output and enforce an exact artifact
+  contract, preventing obsolete packages or developer build files from being shipped.
 
 ## [0.1.0] - 2026-06-18
 

@@ -81,8 +81,28 @@ jobs:
           python-version: "3.13"
       - run: sudo apt-get update && sudo apt-get install -y make gcc
       - run: pip install build pytest
-      # Build a wheel so the offline wheel-inspection tests have an artifact,
-      # then run the full suite including the slow packaging tier.
-      - run: pip wheel . --no-deps -w dist
+      # Seed both setuptools build-lib layouts to prove that a renamed package
+      # cannot leak from a developer's previous build into the wheel.
+      - name: Seed stale build output
+        run: |
+          python - <<'PY'
+          import sys
+          from pathlib import Path
+          from sysconfig import get_platform
+
+          for build_lib in (
+              Path("build/lib"),
+              Path("build/lib.{0}-{1}".format(get_platform(), sys.implementation.cache_tag)),
+          ):
+              stale = build_lib / "valkeylite" / "contaminated.py"
+              stale.parent.mkdir(parents=True, exist_ok=True)
+              stale.write_text("stale\n")
+          PY
+      # Build a wheel so the offline inspection and clean-consumer tests have
+      # an artifact. The standalone checker examines every produced wheel.
+      - name: Build and validate wheel
+        run: |
+          pip wheel . --no-deps -w dist
+          python tools/check_wheel.py dist/*.whl
       - run: pip install .[dev]
       - run: pytest -m "slow or packaging" tests/test_packaging.py
