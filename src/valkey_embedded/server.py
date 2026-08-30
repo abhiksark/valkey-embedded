@@ -20,8 +20,10 @@ import shutil
 import socket
 import subprocess
 import tempfile
+import threading
 import time
 from dataclasses import dataclass
+from enum import Enum, auto
 from typing import Any, Dict, Optional, Set, Tuple, cast
 
 import psutil
@@ -61,6 +63,16 @@ _MANAGED_CONFIG_KEYS = frozenset(
 )
 _SECRET_CONFIG_KEYS = frozenset({"masterauth", "requirepass"})
 _LOGGER = logging.getLogger(__name__)
+
+
+class _ServerState(Enum):
+    """Explicit same-process lifecycle state for ``ValkeyServer``."""
+
+    NEW = auto()
+    STARTING = auto()
+    RUNNING = auto()
+    STOPPING = auto()
+    STOPPED = auto()
 
 
 @dataclass(frozen=True)
@@ -104,7 +116,8 @@ class ValkeyServer:
     """An embedded valkey-server with explicit lifecycle and a TCP endpoint.
 
     Use this when you need a host/port (bring-your-own client, another
-    process, a non-Python tool) or explicit start/stop control. For the
+    process, a non-Python tool) or explicit start/stop control. Instances are
+    reusable across serialized start/stop/terminate cycles. For the
     auto-managed, unix-socket-only client, see
     :class:`~valkey_embedded.client.Valkey` and :func:`~valkey_embedded.connect`.
     """
@@ -148,6 +161,8 @@ class ValkeyServer:
         self._process_create_time: Optional[float] = None
         self._identity: Optional[_DaemonIdentity] = None
         self._atexit_registered = False
+        self._state = _ServerState.NEW
+        self._lifecycle_lock = threading.RLock()
 
         self._owns_dir = data_dir is None
         if data_dir is None:
@@ -155,8 +170,15 @@ class ValkeyServer:
         else:
             self.data_dir = os.path.abspath(str(data_dir))
             os.makedirs(self.data_dir, exist_ok=True)
+        self._retained_data_dir = (
+            self.data_dir if not self._owns_dir or self.persist else None
+        )
 
         self.dbfilename = "valkey.db"
+        self._set_run_paths()
+
+    def _set_run_paths(self) -> None:
+        """Derive one run's managed paths together from its data directory."""
         self.pidfile = os.path.join(self.data_dir, "valkey.pid")
         self.logfile = os.path.join(self.data_dir, "valkey.log")
         self._startup_output_file = os.path.join(
@@ -168,6 +190,24 @@ class ValkeyServer:
             self.data_dir, "valkey.sock"
         )
         self.configfile = os.path.join(self.data_dir, "valkey.conf")
+
+    def _prepare_run_paths(self, reuse_constructed_paths: bool) -> None:
+        """Allocate or recreate all paths for one lifecycle run."""
+        if reuse_constructed_paths:
+            os.makedirs(self.data_dir, exist_ok=True)
+            if self._socket_dir:
+                os.makedirs(self._socket_dir, mode=0o700, exist_ok=True)
+            return
+
+        if self._socket_dir:
+            shutil.rmtree(self._socket_dir, ignore_errors=True)
+        if self._owns_dir and not self.persist:
+            self.data_dir = tempfile.mkdtemp(prefix="valkey_embedded-")
+        else:
+            assert self._retained_data_dir is not None
+            self.data_dir = self._retained_data_dir
+            os.makedirs(self.data_dir, exist_ok=True)
+        self._set_run_paths()
 
     def _validate_config_overrides(self) -> None:
         """Reject config keys that could desynchronize managed lifecycle state."""
@@ -199,47 +239,60 @@ class ValkeyServer:
         """
         if timeout < 0:
             raise ValueError("timeout must be non-negative")
-        if self.is_running():
-            return
 
-        self._identity = None
-        self._process = None
-        self._process_create_time = None
-        self.port = (
-            self._requested_port
-            if self._requested_port is not None
-            else _find_free_port(self.host)
-        )
+        with self._lifecycle_lock:
+            if self._state is _ServerState.RUNNING:
+                if self.is_running():
+                    return
+                # The proven process died outside this API. Retire that run's
+                # files and callback before allocating a new run identity.
+                self._finish_runtime_cleanup()
+            if self._state in (_ServerState.STARTING, _ServerState.STOPPING):
+                raise RuntimeError(
+                    "cannot start ValkeyServer while it is {0}".format(
+                        self._state.name.lower()
+                    )
+                )
 
-        os.makedirs(self.data_dir, exist_ok=True)
-        if self._socket_dir:
-            # A prior stop() removes the fallback socket dir; recreate it.
-            os.makedirs(self._socket_dir, mode=0o700, exist_ok=True)
+            reuse_constructed_paths = self._state is _ServerState.NEW
+            self._state = _ServerState.STARTING
+            self._identity = None
+            self._process = None
+            self._process_create_time = None
+            self.port = None
 
-        snapshot: Optional[_StartupFileSnapshot] = None
-        try:
-            snapshot = self._snapshot_startup_files()
-            self._prepare_runtime_paths()
-            # Stale runtime paths removed by preparation are not caller files to
-            # preserve if this attempt recreates them and then fails.
-            snapshot.runtime_paths = {
-                path
-                for path in (self.pidfile, self.socket_file)
-                if os.path.exists(path)
-            }
-            self._write_config()
-            self._launch_process()
-            self._wait_until_ready(timeout)
-            self._register_atexit()
-        except BaseException as exc:
-            # Roll back only the process and files acquired by this attempt.
-            # BaseException is deliberate: KeyboardInterrupt/SystemExit must not
-            # strand a direct child process or atexit callback.
-            failure = self._normalize_startup_exception(exc)
-            self._rollback_failed_start(snapshot)
-            if failure is exc:
-                raise
-            raise failure from exc
+            snapshot: Optional[_StartupFileSnapshot] = None
+            try:
+                self._prepare_run_paths(reuse_constructed_paths)
+                self.port = (
+                    self._requested_port
+                    if self._requested_port is not None
+                    else _find_free_port(self.host)
+                )
+                snapshot = self._snapshot_startup_files()
+                self._prepare_runtime_paths()
+                # Stale runtime paths removed by preparation are not caller files to
+                # preserve if this attempt recreates them and then fails.
+                snapshot.runtime_paths = {
+                    path
+                    for path in (self.pidfile, self.socket_file)
+                    if os.path.exists(path)
+                }
+                self._write_config()
+                self._launch_process()
+                self._wait_until_ready(timeout)
+                self._register_atexit()
+            except BaseException as exc:
+                # Roll back only the process and files acquired by this attempt.
+                # BaseException is deliberate: KeyboardInterrupt/SystemExit must not
+                # strand a direct child process or atexit callback.
+                failure = self._normalize_startup_exception(exc)
+                self._rollback_failed_start(snapshot)
+                self._state = _ServerState.STOPPED
+                if failure is exc:
+                    raise
+                raise failure from exc
+            self._state = _ServerState.RUNNING
 
     def _prepare_runtime_paths(self) -> None:
         """Refuse live runtime state and remove only demonstrably stale files."""
@@ -525,8 +578,8 @@ class ValkeyServer:
 
     def _startup_error(self, reason: str) -> ServerStartError:
         """Create an actionable bounded error before failed files are removed."""
-        assert self.port is not None
-        message = "{0} for {1}:{2}".format(reason, self.host, self.port)
+        endpoint_port: object = self.port if self.port is not None else "<unassigned>"
+        message = "{0} for {1}:{2}".format(reason, self.host, endpoint_port)
         log_tail = self._redacted_log_tail()
         startup_tail = self._redacted_file_tail(self._startup_output_file)
         if log_tail:
@@ -642,52 +695,97 @@ class ValkeyServer:
                 os.close(fd)
 
     def stop(self, timeout: float = 5.0) -> None:
-        """Gracefully shut down the verified server and clean runtime files."""
-        identity = self._identity
-        if identity is not None and self._matching_process(
-            identity.pid, identity.create_time
-        ):
-            try:
-                probe = self._private_client(
-                    socket_connect_timeout=1,
-                    socket_timeout=1,
-                )
-                try:
-                    info = cast(Dict[str, Any], probe.info("server"))
-                    endpoint_matches = (
-                        int(info["process_id"]) == identity.pid
-                        and str(info["run_id"]) == identity.run_id
+        """Gracefully stop this run; repeated calls are bounded no-ops."""
+        with self._lifecycle_lock:
+            if self._state is _ServerState.STOPPED:
+                return
+            if self._state is _ServerState.NEW:
+                self._discard_unstarted_paths()
+                return
+            if self._state in (_ServerState.STARTING, _ServerState.STOPPING):
+                raise RuntimeError(
+                    "cannot stop ValkeyServer while it is {0}".format(
+                        self._state.name.lower()
                     )
-                    if endpoint_matches:
-                        if self.persist:
-                            probe.shutdown(save=True)
-                        else:
-                            probe.shutdown(nosave=True)
-                finally:
-                    probe.close()  # type: ignore[no-untyped-call]
-            except Exception:  # noqa: BLE001 - shutdown closes its own socket
-                pass
-            self._terminate_process(identity.pid, identity.create_time, timeout)
+                )
 
-        self._cleanup_files()
-        self._unregister_atexit()
-        self._reset_runtime_state()
+            self._state = _ServerState.STOPPING
+            identity = self._identity
+            try:
+                if identity is not None and self._matching_process(
+                    identity.pid, identity.create_time
+                ):
+                    try:
+                        probe = self._private_client(
+                            socket_connect_timeout=1,
+                            socket_timeout=1,
+                        )
+                        try:
+                            info = cast(Dict[str, Any], probe.info("server"))
+                            endpoint_matches = (
+                                int(info["process_id"]) == identity.pid
+                                and str(info["run_id"]) == identity.run_id
+                            )
+                            if endpoint_matches:
+                                if self.persist:
+                                    probe.shutdown(save=True)
+                                else:
+                                    probe.shutdown(nosave=True)
+                        finally:
+                            probe.close()  # type: ignore[no-untyped-call]
+                    except Exception as exc:  # noqa: BLE001 - socket closes on shutdown
+                        _LOGGER.debug("graceful shutdown probe failed: %s", exc)
+                    self._terminate_process(identity.pid, identity.create_time, timeout)
+            finally:
+                self._finish_runtime_cleanup()
 
     def terminate(self) -> None:
-        """Kill the verified server immediately (no save), then clean up."""
-        identity = self._identity
-        if identity is not None:
-            process = self._matching_process(identity.pid, identity.create_time)
-            if process is not None:
-                try:
-                    process.kill()
-                    process.wait(timeout=5)
-                except (psutil.NoSuchProcess, psutil.TimeoutExpired):
-                    pass
+        """Kill this run immediately; repeated calls are bounded no-ops."""
+        with self._lifecycle_lock:
+            if self._state is _ServerState.STOPPED:
+                return
+            if self._state is _ServerState.NEW:
+                self._discard_unstarted_paths()
+                return
+            if self._state in (_ServerState.STARTING, _ServerState.STOPPING):
+                raise RuntimeError(
+                    "cannot terminate ValkeyServer while it is {0}".format(
+                        self._state.name.lower()
+                    )
+                )
 
-        self._cleanup_files()
+            self._state = _ServerState.STOPPING
+            identity = self._identity
+            try:
+                if identity is not None:
+                    process = self._matching_process(identity.pid, identity.create_time)
+                    if process is not None:
+                        try:
+                            process.kill()
+                            process.wait(timeout=5)
+                        except (psutil.NoSuchProcess, psutil.TimeoutExpired):
+                            pass
+            finally:
+                self._finish_runtime_cleanup()
+
+    def _discard_unstarted_paths(self) -> None:
+        """Move NEW to STOPPED without deleting caller-owned runtime names."""
+        if self._owns_dir and not self.persist:
+            shutil.rmtree(self.data_dir, ignore_errors=True)
+        if self._socket_dir:
+            shutil.rmtree(self._socket_dir, ignore_errors=True)
         self._unregister_atexit()
         self._reset_runtime_state()
+        self._state = _ServerState.STOPPED
+
+    def _finish_runtime_cleanup(self) -> None:
+        """Retire all state belonging to a started or externally dead run."""
+        try:
+            self._cleanup_files()
+        finally:
+            self._unregister_atexit()
+            self._reset_runtime_state()
+            self._state = _ServerState.STOPPED
 
     def _terminate_process(self, pid: int, create_time: float, timeout: float) -> None:
         """Stop one creation-time-verified process with bounded escalation."""
@@ -780,17 +878,21 @@ class ValkeyServer:
 
     @property
     def pid(self) -> int:
-        """Verified daemon PID, or zero when its creation identity is not live."""
+        """Verified daemon PID, or zero outside the live RUNNING state."""
         identity = self._identity
-        if identity is None:
+        if self._state is not _ServerState.RUNNING or identity is None:
             return 0
         if self._matching_process(identity.pid, identity.create_time) is None:
             return 0
         return identity.pid
 
     def is_running(self) -> bool:
-        """Return whether the identity-proven direct child is still running."""
-        return self.port is not None and self.pid != 0
+        """Return whether RUNNING still has its identity-proven direct child."""
+        return (
+            self._state is _ServerState.RUNNING
+            and self.port is not None
+            and self.pid != 0
+        )
 
     def _private_client(self, **kwargs: Any) -> valkey.Valkey:
         """Return an internal client for this instance's private Unix socket."""

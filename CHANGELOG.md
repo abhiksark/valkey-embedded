@@ -15,6 +15,9 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 - Failed `ValkeyServer.start()` calls now transactionally terminate their owned
   child, restore caller-owned files, remove generated runtime state, reset the
   object, and include bounded redacted startup diagnostics.
+- `ValkeyServer` now has an explicit serialized lifecycle and can restart after
+  `stop()`, `terminate()`, failed startup, or external process death; each
+  disposable run receives fresh paths while persistent paths and data are reused.
 - `Valkey.close()` now stops the embedded server when the last client closes,
   releases its connection pool, and cleans up owned runtime files immediately.
 

@@ -122,8 +122,12 @@ and `make`). Windows is unsupported (WSL works).
   raises `ServerStartError`; it is never mistaken for or attached as this server.
   Any failed start is transactional: its child and generated runtime files are
   removed, caller-owned files are restored, and the object returns to stopped
-  state without requiring a compensating `stop()` call. Endpoint/path directives
-  such as `port`, `bind`, `pidfile`, and `unixsocket`
+  state without requiring a compensating `stop()` call. The same instance can be
+  started again after `stop()` or `terminate()`: disposable servers receive a
+  fresh private directory and run identity, while persistent or caller-provided
+  directories are reused. A requested port is requested again; an automatic port
+  may change, and endpoint properties describe only the current run.
+  Endpoint/path directives such as `port`, `bind`, `pidfile`, and `unixsocket`
   are managed by the constructor and cannot be replaced through `config`.
 
   > `Valkey()` stays unix-socket-only with no TCP listener (private by default);
