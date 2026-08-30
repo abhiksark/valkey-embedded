@@ -14,6 +14,7 @@ reachability alone is never treated as ownership.
 from __future__ import annotations
 
 import atexit
+import logging
 import os
 import shutil
 import socket
@@ -21,7 +22,7 @@ import subprocess
 import tempfile
 import time
 from dataclasses import dataclass
-from typing import Any, Dict, Optional, Set, cast
+from typing import Any, Dict, Optional, Set, Tuple, cast
 
 import psutil
 import valkey
@@ -59,6 +60,7 @@ _MANAGED_CONFIG_KEYS = frozenset(
     }
 )
 _SECRET_CONFIG_KEYS = frozenset({"masterauth", "requirepass"})
+_LOGGER = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -68,6 +70,16 @@ class _DaemonIdentity:
     pid: int
     create_time: float
     run_id: str
+
+
+@dataclass
+class _StartupFileSnapshot:
+    """Caller file state that a failed startup attempt must restore."""
+
+    runtime_paths: Set[str]
+    config_content: Optional[bytes]
+    config_mode: Optional[int]
+    append_files: Dict[str, Tuple[int, int]]
 
 
 class _StartupNotReady(Exception):
@@ -147,6 +159,9 @@ class ValkeyServer:
         self.dbfilename = "valkey.db"
         self.pidfile = os.path.join(self.data_dir, "valkey.pid")
         self.logfile = os.path.join(self.data_dir, "valkey.log")
+        self._startup_output_file = os.path.join(
+            self.data_dir, "valkey.startup-output.log"
+        )
         # Deep data dirs would overflow AF_UNIX's sun_path; relocate the
         # socket to a short private dir in that case (cleaned up on stop).
         self.socket_file, self._socket_dir = _socket_path_for(
@@ -201,29 +216,30 @@ class ValkeyServer:
             # A prior stop() removes the fallback socket dir; recreate it.
             os.makedirs(self._socket_dir, mode=0o700, exist_ok=True)
 
-        runtime_paths = {
-            self.pidfile,
-            self.socket_file,
-            self.configfile,
-            self.logfile,
-        }
-        preexisting_files = {path for path in runtime_paths if os.path.exists(path)}
-
+        snapshot: Optional[_StartupFileSnapshot] = None
         try:
+            snapshot = self._snapshot_startup_files()
             self._prepare_runtime_paths()
             # Stale runtime paths removed by preparation are not caller files to
             # preserve if this attempt recreates them and then fails.
-            preexisting_files = {path for path in runtime_paths if os.path.exists(path)}
+            snapshot.runtime_paths = {
+                path
+                for path in (self.pidfile, self.socket_file)
+                if os.path.exists(path)
+            }
             self._write_config()
             self._launch_process()
-            self._register_atexit()
             self._wait_until_ready(timeout)
-        except BaseException:
+            self._register_atexit()
+        except BaseException as exc:
             # Roll back only the process and files acquired by this attempt.
             # BaseException is deliberate: KeyboardInterrupt/SystemExit must not
             # strand a direct child process or atexit callback.
-            self._rollback_failed_start(preexisting_files)
-            raise
+            failure = self._normalize_startup_exception(exc)
+            self._rollback_failed_start(snapshot)
+            if failure is exc:
+                raise
+            raise failure from exc
 
     def _prepare_runtime_paths(self) -> None:
         """Refuse live runtime state and remove only demonstrably stale files."""
@@ -251,6 +267,33 @@ class ValkeyServer:
                 )
             finally:
                 probe.close()
+
+    def _snapshot_startup_files(self) -> _StartupFileSnapshot:
+        """Capture caller-owned files before this attempt mutates them."""
+        config_content: Optional[bytes] = None
+        config_mode: Optional[int] = None
+        if os.path.exists(self.configfile):
+            config_stat = os.stat(self.configfile)
+            with open(self.configfile, "rb") as fh:
+                config_content = fh.read()
+            config_mode = config_stat.st_mode & 0o7777
+
+        append_files: Dict[str, Tuple[int, int]] = {}
+        for path in (self.logfile, self._startup_output_file):
+            if os.path.exists(path):
+                file_stat = os.stat(path)
+                append_files[path] = (file_stat.st_size, file_stat.st_mode & 0o7777)
+
+        return _StartupFileSnapshot(
+            runtime_paths={
+                path
+                for path in (self.pidfile, self.socket_file)
+                if os.path.exists(path)
+            },
+            config_content=config_content,
+            config_mode=config_mode,
+            append_files=append_files,
+        )
 
     def _write_config(self) -> None:
         """Render a private config whose identity settings cannot be replaced."""
@@ -288,11 +331,23 @@ class ValkeyServer:
         if not executable or not os.path.exists(executable):
             raise ServerStartError(_missing_binary_message(executable))
         try:
-            process = subprocess.Popen(
-                [executable, self.configfile],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
+            output_fd = os.open(
+                self._startup_output_file,
+                os.O_WRONLY | os.O_CREAT | os.O_APPEND,
+                0o600,
             )
+            try:
+                os.fchmod(output_fd, 0o600)
+                with os.fdopen(output_fd, "ab", buffering=0) as output:
+                    output_fd = -1
+                    process = subprocess.Popen(
+                        [executable, self.configfile],
+                        stdout=output,
+                        stderr=subprocess.STDOUT,
+                    )
+            finally:
+                if output_fd >= 0:
+                    os.close(output_fd)
         except OSError as exc:
             raise ServerStartError(
                 "could not launch bundled valkey-server at {0!r}: {1}".format(
@@ -460,21 +515,38 @@ class ValkeyServer:
                 )
             )
 
+    def _normalize_startup_exception(self, exc: BaseException) -> BaseException:
+        """Wrap unexpected startup failures without replacing control signals."""
+        if isinstance(exc, ServerStartError) or not isinstance(exc, Exception):
+            return exc
+        return self._startup_error(
+            "valkey-server startup failed: {0}: {1}".format(type(exc).__name__, exc)
+        )
+
     def _startup_error(self, reason: str) -> ServerStartError:
         """Create an actionable bounded error before failed files are removed."""
         assert self.port is not None
         message = "{0} for {1}:{2}".format(reason, self.host, self.port)
         log_tail = self._redacted_log_tail()
+        startup_tail = self._redacted_file_tail(self._startup_output_file)
         if log_tail:
             message += "\nvalkey.log tail ({0}):\n{1}".format(self.logfile, log_tail)
-        else:
-            message += "; no valkey log output was captured at {0}".format(self.logfile)
+        if startup_tail:
+            message += "\nvalkey startup output tail ({0}):\n{1}".format(
+                self._startup_output_file, startup_tail
+            )
+        if not log_tail and not startup_tail:
+            message += "; no valkey startup output was captured"
         return ServerStartError(message)
 
     def _redacted_log_tail(self) -> str:
-        """Return a bounded startup log tail with configured secrets removed."""
+        """Return the bounded, redacted managed Valkey log tail."""
+        return self._redacted_file_tail(self.logfile)
+
+    def _redacted_file_tail(self, path: str) -> str:
+        """Return a bounded file tail with configured secrets removed."""
         try:
-            with open(self.logfile, "rb") as fh:
+            with open(path, "rb") as fh:
                 fh.seek(0, os.SEEK_END)
                 size = fh.tell()
                 fh.seek(max(0, size - _LOG_TAIL_BYTES))
@@ -491,47 +563,83 @@ class ValkeyServer:
                     tail = tail.replace(str(secret), "<redacted>")
         return tail.strip()
 
-    def _rollback_failed_start(self, preexisting_files: Set[str]) -> None:
-        """Terminate only this attempt's child and remove its acquired state."""
+    def _rollback_failed_start(self, snapshot: Optional[_StartupFileSnapshot]) -> None:
+        """Terminate only this attempt's child and restore caller file state."""
         process = self._process
         create_time = self._process_create_time
-        if process is not None and create_time is not None:
-            self._terminate_process(process.pid, create_time, timeout=0)
-        elif process is not None:
-            # poll() identifies whether this exact child is still waitable. If
-            # alive, capture creation time before signalling to prevent PID reuse.
-            if process.poll() is None:
-                try:
-                    create_time = psutil.Process(process.pid).create_time()
-                except psutil.NoSuchProcess:
-                    create_time = None
-                if create_time is not None:
-                    self._terminate_process(process.pid, create_time, timeout=0)
+        try:
+            if process is not None and create_time is not None:
+                self._terminate_process(process.pid, create_time, timeout=0)
+            elif process is not None:
+                # poll() identifies whether this exact child is still waitable. If
+                # alive, capture creation time before signalling to prevent PID reuse.
+                if process.poll() is None:
+                    try:
+                        create_time = psutil.Process(process.pid).create_time()
+                    except psutil.NoSuchProcess:
+                        create_time = None
+                    if create_time is not None:
+                        self._terminate_process(process.pid, create_time, timeout=0)
+        except Exception as exc:  # noqa: BLE001 - preserve the startup failure
+            _LOGGER.warning("failed to terminate owned startup process: %s", exc)
 
         if process is not None:
             try:
                 process.wait(timeout=0)
-            except subprocess.TimeoutExpired:
+            except (OSError, subprocess.TimeoutExpired):
                 pass
 
-        if self._owns_dir:
-            # A failed attempt never commits persistence ownership, even when
-            # persist=True; its automatically-created directory is disposable.
-            shutil.rmtree(self.data_dir, ignore_errors=True)
-        else:
-            for path in (
-                self.pidfile,
-                self.socket_file,
-                self.configfile,
-                self.logfile,
-            ):
-                if path not in preexisting_files:
-                    _safe_remove(path)
-        if self._socket_dir:
-            shutil.rmtree(self._socket_dir, ignore_errors=True)
+        try:
+            if self._owns_dir and not self.persist:
+                shutil.rmtree(self.data_dir, ignore_errors=True)
+            elif snapshot is not None:
+                # Persistent and caller-owned directories survive, while files
+                # mutated or generated by this attempt return to their old state.
+                self._restore_startup_files(snapshot)
+            if self._socket_dir:
+                shutil.rmtree(self._socket_dir, ignore_errors=True)
+        except Exception as exc:  # noqa: BLE001 - preserve the startup failure
+            _LOGGER.warning("failed to restore startup files: %s", exc)
+        finally:
+            self._unregister_atexit()
+            self._reset_runtime_state()
 
-        self._unregister_atexit()
-        self._reset_runtime_state()
+    def _restore_startup_files(self, snapshot: _StartupFileSnapshot) -> None:
+        """Restore caller files and remove files generated by a failed attempt."""
+        for path in (self.pidfile, self.socket_file):
+            if path not in snapshot.runtime_paths:
+                _safe_remove(path)
+
+        if snapshot.config_content is None:
+            _safe_remove(self.configfile)
+        else:
+            fd = os.open(
+                self.configfile,
+                os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
+                snapshot.config_mode or 0o600,
+            )
+            try:
+                if snapshot.config_mode is not None:
+                    os.fchmod(fd, snapshot.config_mode)
+                with os.fdopen(fd, "wb") as fh:
+                    fd = -1
+                    fh.write(snapshot.config_content)
+            finally:
+                if fd >= 0:
+                    os.close(fd)
+
+        for path in (self.logfile, self._startup_output_file):
+            previous = snapshot.append_files.get(path)
+            if previous is None:
+                _safe_remove(path)
+                continue
+            size, mode = previous
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT, mode)
+            try:
+                os.ftruncate(fd, size)
+                os.fchmod(fd, mode)
+            finally:
+                os.close(fd)
 
     def stop(self, timeout: float = 5.0) -> None:
         """Gracefully shut down the verified server and clean runtime files."""
@@ -637,8 +745,8 @@ class ValkeyServer:
             return
         try:
             atexit.unregister(self.stop)
-        except Exception:  # noqa: BLE001 - best-effort interpreter cleanup
-            pass
+        except Exception as exc:  # noqa: BLE001 - best-effort interpreter cleanup
+            _LOGGER.debug("could not unregister atexit callback: %s", exc)
         self._atexit_registered = False
 
     def _reset_runtime_state(self) -> None:

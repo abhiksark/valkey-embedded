@@ -120,7 +120,10 @@ and `make`). Windows is unsupported (WSL works).
   `start()` returns only after the launched PID, private Unix socket, and public
   TCP endpoint report the same Valkey run identity. An occupied requested port
   raises `ServerStartError`; it is never mistaken for or attached as this server.
-  Endpoint/path directives such as `port`, `bind`, `pidfile`, and `unixsocket`
+  Any failed start is transactional: its child and generated runtime files are
+  removed, caller-owned files are restored, and the object returns to stopped
+  state without requiring a compensating `stop()` call. Endpoint/path directives
+  such as `port`, `bind`, `pidfile`, and `unixsocket`
   are managed by the constructor and cannot be replaced through `config`.
 
   > `Valkey()` stays unix-socket-only with no TCP listener (private by default);

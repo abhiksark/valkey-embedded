@@ -402,7 +402,7 @@ def test_rollback_recovers_direct_child_creation_identity(monkeypatch):
         ),
     )
 
-    server._rollback_failed_start(set())
+    server._rollback_failed_start(None)
 
     assert terminate_calls == [(process.pid, 42.0, 0)]
     assert process.wait_calls == [0]
