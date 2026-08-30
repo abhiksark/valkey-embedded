@@ -18,6 +18,9 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 - `ValkeyServer` now has an explicit serialized lifecycle and can restart after
   `stop()`, `terminate()`, failed startup, or external process death; each
   disposable run receives fresh paths while persistent paths and data are reused.
+- `unpatch_valkey()` and its per-name variants now restore exact embedded class
+  path settings as well as upstream symbols; alias state is reference-aware,
+  conflicting active database paths fail clearly, and partial patches roll back.
 - `Valkey.close()` now stops the embedded server when the last client closes,
   releases its connection pool, and cleans up owned runtime files immediately.
 
