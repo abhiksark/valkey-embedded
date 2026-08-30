@@ -21,8 +21,13 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 - `unpatch_valkey()` and its per-name variants now restore exact embedded class
   path settings as well as upstream symbols; alias state is reference-aware,
   conflicting active database paths fail clearly, and partial patches roll back.
-- `Valkey.close()` now stops the embedded server when the last client closes,
-  releases its connection pool, and cleans up owned runtime files immediately.
+- Shared `Valkey()` registries are now private, atomic, versioned records that
+  verify process creation time, bundled executable, Unix endpoint, config path,
+  and Valkey run ID before attachment or signalling. Managed holder identities,
+  rather than raw connection counts, serialize cross-process final cleanup and
+  recover safely after holder processes exit.
+- `Valkey.close()` now releases its connection pool and cleans up owned runtime
+  files immediately when the last managed holder closes.
 
 ## [0.1.0] - 2026-06-18
 
