@@ -133,6 +133,13 @@ and `make`). Windows is unsupported (WSL works).
   > `Valkey()` stays unix-socket-only with no TCP listener (private by default);
   > reach for `ValkeyServer` when you need a port.
 
+- **Temporary valkey-py patching:** `patch_valkey(dbfile=...)` replaces
+  `valkey.Valkey` and `valkey.StrictValkey` for compatibility tests, while
+  `unpatch_valkey()` restores the exact upstream objects and embedded class path
+  settings. Per-name patching
+  shares one class configuration while either alias remains active; requesting a
+  conflicting database path raises `ValueError` instead of silently changing it.
+
 - **Pytest fixtures:** installing the package registers fixtures automatically —
   no conftest wiring. One server runs per test session; each test gets a client
   with a clean keyspace (`FLUSHALL` on setup):
