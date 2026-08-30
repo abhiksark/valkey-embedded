@@ -30,12 +30,15 @@ PYTHONPATH=src python -m pytest
 ```bash
 pytest                  # fast tier (default; `slow` is deselected)
 pytest -m slow          # heavy/network tier: sdist build, clean-venv install
-pytest -m packaging     # build-artifact inspection (offline, fast)
+pytest -m packaging     # exact inspection of every wheel already in dist/
 pytest -m examples      # runs every script in examples/ end-to-end
 ```
 
 The full suite must be green before a PR is merged. CI runs the fast tier on
-Python 3.9 and 3.13 (Linux + macOS), plus lint and packaging jobs.
+Python 3.9–3.13 (Linux + macOS), plus lint and packaging jobs. To validate wheel
+contents directly, run `python tools/check_wheel.py dist/*.whl`; the checker rejects
+unexpected namespaces, stale files, incomplete licenses, unsafe modes, and inconsistent
+metadata.
 
 Run the same branch-aware coverage gate as CI with:
 
@@ -99,4 +102,5 @@ Per release:
    `version` in `pyproject.toml`.
 2. `git tag vX.Y.Z && git push --tags` — the release workflow builds wheels +
    sdist, runs the suite against each wheel, `twine check`s the artifacts, and
-   publishes to PyPI via trusted publishing.
+   validates the exact contents of every wheel, and publishes to PyPI via trusted
+   publishing.

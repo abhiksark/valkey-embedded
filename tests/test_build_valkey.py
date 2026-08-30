@@ -8,6 +8,7 @@ so they are tested directly without downloading or compiling anything.
 import hashlib
 import importlib.util
 import io
+import json
 import os
 import sys
 import tarfile
@@ -75,6 +76,99 @@ def test_default_version_is_pinned():
     version = build_valkey.VALKEY_VERSION
     assert version in build_valkey.KNOWN_SHA256, "default VALKEY_VERSION is unpinned"
     assert len(build_valkey.KNOWN_SHA256[version]) == 64
+
+
+def _cached_build(tmp_path, version="8.1.8"):
+    target = tmp_path / "bin"
+    target.mkdir()
+    for name in ("valkey-server", "valkey-cli"):
+        binary = target / name
+        binary.write_bytes(b"binary")
+        binary.chmod(0o755)
+    (target / "VALKEY_COPYING.txt").write_text(
+        "\n".join(
+            marker + "\n" + ("complete license text " * 30)
+            for marker in build_valkey._license_markers(version)
+        )
+    )
+    metadata = tmp_path / "package_metadata.json"
+    metadata.write_text(
+        json.dumps(
+            {
+                "valkey_embedded_version": "old-project-version",
+                "valkey_server_version": version,
+                "valkey_server_banner": "old banner",
+                "valkey_executable": "bin/valkey-server",
+            }
+        )
+    )
+    return target, metadata
+
+
+def test_cached_build_requires_complete_executable_artifacts(tmp_path, monkeypatch):
+    target, metadata = _cached_build(tmp_path)
+    monkeypatch.setattr(
+        build_valkey,
+        "_server_version",
+        lambda binary: "Valkey server v=8.1.8 build=test",
+    )
+    monkeypatch.setattr(
+        build_valkey.subprocess,
+        "check_output",
+        lambda command, text: "valkey-cli 8.1.8",
+    )
+
+    assert build_valkey._is_current(target, str(metadata), "8.1.8") is True
+
+    (target / "valkey-cli").chmod(0o644)
+    assert build_valkey._is_current(target, str(metadata), "8.1.8") is False
+    (target / "valkey-cli").chmod(0o755)
+    (target / "valkey-cli").unlink()
+    assert build_valkey._is_current(target, str(metadata), "8.1.8") is False
+    (target / "valkey-cli").symlink_to(target / "valkey-server")
+    assert build_valkey._is_current(target, str(metadata), "8.1.8") is False
+
+
+def test_cached_build_requires_complete_license_bundle(tmp_path, monkeypatch):
+    target, metadata = _cached_build(tmp_path)
+    monkeypatch.setattr(
+        build_valkey,
+        "_server_version",
+        lambda binary: "Valkey server v=8.1.8 build=test",
+    )
+    monkeypatch.setattr(
+        build_valkey.subprocess,
+        "check_output",
+        lambda command, text: "valkey-cli 8.1.8",
+    )
+    (target / "VALKEY_COPYING.txt").write_text("incomplete")
+
+    assert build_valkey._is_current(target, str(metadata), "8.1.8") is False
+
+
+def test_reused_binary_refreshes_project_metadata(tmp_path, monkeypatch):
+    target, metadata = _cached_build(tmp_path)
+    monkeypatch.setattr(
+        build_valkey,
+        "_server_version",
+        lambda binary: "Valkey server v=8.1.8 build=current",
+    )
+    monkeypatch.setattr(
+        build_valkey.subprocess,
+        "check_output",
+        lambda command, text: "valkey-cli 8.1.8",
+    )
+    monkeypatch.setattr(build_valkey, "_project_version", lambda: "0.2.0")
+
+    build_valkey.build(str(target), str(metadata), version="8.1.8")
+
+    refreshed = json.loads(metadata.read_text())
+    assert refreshed == {
+        "valkey_embedded_version": "0.2.0",
+        "valkey_server_version": "8.1.8",
+        "valkey_server_banner": "Valkey server v=8.1.8 build=current",
+        "valkey_executable": "bin/valkey-server",
+    }
 
 
 @pytest.mark.skipif(

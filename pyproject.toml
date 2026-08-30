@@ -69,6 +69,9 @@ exclude = ["valkey_embedded.bin", "valkey_embedded.bin.*"]
 [tool.setuptools.package-data]
 valkey_embedded = ["py.typed", "bin/valkey-server", "bin/valkey-cli", "bin/VALKEY_COPYING.txt", "package_metadata.json"]
 
+[tool.setuptools.exclude-package-data]
+valkey_embedded = ["_dummy.c"]
+
 [tool.ruff]
 target-version = "py39"
 
